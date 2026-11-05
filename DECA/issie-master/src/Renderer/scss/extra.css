@@ -1,0 +1,591 @@
+@keyframes codeEditorBlink { to {opacity: 0;}}
+
+/* ---------------------------------------------------------------------------
+   Moved here from the tail of main.css, where it had been hand-edited into the
+   generated Bulma output since 2022. main.css is vendored and regenerates from
+   nothing; this is the file to edit.
+   --------------------------------------------------------------------------- */
+
+/* Bulma sets `overflow-y: scroll` on html so that web pages do not jog sideways
+   as content grows past a screenful. Issie is a window, not a page: every view
+   is positioned and sized to the viewport, the document itself never scrolls,
+   and all that rule leaves is a dead scrollbar down the right-hand edge. */
+html {
+  overflow-y: auto;
+}
+
+.hide {
+  display: none;
+}
+
+.error:hover + .hide {
+  display:inline-block;
+  position: absolute;
+  margin-left: 10px;
+  padding: 3px 10px;
+  color: white;
+  font-weight: normal;
+  background-color: rgba(0, 0, 0, 0.7);
+}
+
+/* Added in 2022 for the Verilog error table, but unscoped, so these are in fact
+   the app's table styling everywhere: truth tables, the memory editor, the wave
+   sim RAM views, parameter view, the Info popup. Scoping them to the error table
+   would restyle all of those, so they are left global deliberately. */
+tbody tr:nth-child(odd){
+  background-color: #f0f0f0;
+}
+
+th, td {
+  border-style: groove;
+  border-right: none;
+  border-left: none;
+}
+
+
+
+.info::before { content: "\1f6c8"; }
+
+.is-pink {
+  background-color: hotpink;
+}
+
+.is-darkslategrey {
+    background-color: #596673; /*roughly slategrey*/
+    color: white;
+}
+
+.is-lightslategrey {
+  background-color: #9aa6b1;
+  color: black;
+}
+
+/* sheet-menu pill colours for the parameter system's top sheet:
+   the top of the design, and the sheets outside its instance tree */
+.is-darkgreen {
+  background-color: #1f7a3f;
+  color: white;
+}
+
+.is-grey {
+  background-color: #7a848e;
+  color: white;
+}
+
+/* sheet-menu pill colours for a library component opened to be looked at: neither the user's own
+   sheet nor a locked one, so a colour of its own rather than a shade of an existing meaning - the
+   greens above already say "top sheet" twice over. Lighter when it is the sheet on screen, as the
+   other pairs are. */
+.is-mediumpurple {
+  background-color: #8f6bc4;
+  color: white;
+}
+
+.is-rebeccapurple {
+  background-color: #5f3d92;
+  color: white;
+}
+
+/* Field tooltips in the Properties pane.
+
+   Bulma centres a tooltip on the thing it explains. These explain short labels down the left edge
+   of a pane about 300px wide, and a multiline tooltip is 15rem, so centred on "Name" half of it
+   lands outside the pane - and the pane scrolls, which means overflow is not visible on one axis
+   and therefore clipped on both. Anchored to the label's left edge it opens into the pane instead.
+
+   The selector has to out-specify bulma-tooltip's own, which is
+   [data-tooltip]:not(.is-loading).has-tooltip-bottom::before. The arrow is left centred on the
+   label: it points at the word, and the box now starts under it rather than around it. */
+.field-tip[data-tooltip].has-tooltip-bottom.has-tooltip-multiline::before {
+  left: 0;
+  transform: translate(0, 100%);
+}
+
+/* ---------------------------------------------------------------------------
+   Top menu bar density.
+
+   Issie has to stay usable in a small window, and the bar was mostly padding:
+   measured at a 724px window, its items took 530px of which only about 190px
+   was text. Bulma reserves 2.5em on the right of every dropdown label to house
+   the arrow, and 1em each side of a button. These pull that in without
+   changing a component, a colour or a font, so the look is unaltered.
+
+   Everything is scoped to #TopMenu, and the button rule to buttons that are a
+   direct child of a navbar-item, so the sheet tree's breadcrumb buttons inside
+   the Sheets dropdown keep their own spacing.
+   --------------------------------------------------------------------------- */
+
+/* the arrow stays, it just sits closer to the word: 2.5em -> 1.4em */
+#TopMenu .navbar-link:not(.is-arrowless) {
+  padding-right: 1.4em;
+}
+
+/* Sits nearer the right edge than Bulma's 1.125em, which leaves a bigger gap between the
+   word and the arrow inside the same tightened padding. Chosen for a 6px gap: the arrow is
+   about 0.625em across, so this and the 1.4em padding above set the clear space between the
+   word and the arrow. At 0.55em they nearly touched. */
+#TopMenu .navbar-link:not(.is-arrowless)::after {
+  right: 0.4em;
+}
+
+/* Save, Info and Back: 1em -> 0.6em a side */
+#TopMenu .navbar-item > .button {
+  padding-left: 0.6em;
+  padding-right: 0.6em;
+}
+
+/* ---------------------------------------------------------------------------
+   Keep the menu bar in its desktop layout at every window width.
+
+   Bulma's navbar is built for a page that collapses to a burger menu on a
+   phone, so everything that makes a dropdown a dropdown - position: absolute,
+   top: 100%, left: 0, the background, border and shadow - sits inside
+   @media (min-width: 1024px). Below that the dropdown is just a padded block,
+   and since .navbar-brand is a flex row at all widths it lays out *beside* its
+   trigger instead of below it: shrink the window and the Project menu opens as
+   a column of items to the right of the word "Project".
+
+   Issie is a desktop application whose window is often narrower than 1024px,
+   and it has no burger menu to collapse to, so the mobile layout is never what
+   is wanted. These are Bulma's own desktop rules, applied unconditionally and
+   scoped to the menu bar. Above 1024px they simply restate what Bulma already
+   says. display is deliberately not set: the dropdowns are shown and hidden by
+   an inline style driven by TopMenuOpenState.
+   --------------------------------------------------------------------------- */
+#TopMenu .navbar,
+#TopMenu .navbar-menu,
+#TopMenu .navbar-start,
+#TopMenu .navbar-end {
+  align-items: stretch;
+  display: flex;
+}
+
+#TopMenu .navbar-item,
+#TopMenu .navbar-link {
+  align-items: center;
+  display: flex;
+}
+
+#TopMenu .navbar-item.has-dropdown {
+  align-items: stretch;
+}
+
+#TopMenu .navbar-dropdown {
+  background-color: white;
+  border-bottom-left-radius: 6px;
+  border-bottom-right-radius: 6px;
+  border-top: 2px solid #dbdbdb;
+  box-shadow: 0 8px 8px rgba(10, 10, 10, 0.1);
+  font-size: 0.875rem;
+  left: 0;
+  min-width: 100%;
+  position: absolute;
+  top: 100%;
+  z-index: 20;
+}
+
+#TopMenu .navbar-dropdown .navbar-item {
+  padding: 0.375rem 1rem;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   Sheet hierarchy tree connectors.
+
+   The tree is a CSS grid: depth is the column, and a node with children spans
+   exactly the rows its children occupy. That used to be shown by painting a
+   node with children as a grey block behind them, which said what belonged to
+   what but filled the space the eye needs to follow the structure.
+
+   Instead each child draws its own connector into the column gap to its left:
+   an elbow across to the node, and half or all of a vertical trunk. The first
+   child draws from its centre down, the last from the top to its centre, and
+   the ones between draw the whole height, so together they form one unbroken
+   line from the first child to the last, flush against the parent's edge. An
+   only child needs no trunk - the elbow alone reaches its parent, whose centre
+   is at the same height.
+
+   This works only because the grid has no row gap: see gridBoxSeparation in
+   MiscMenuView, which also passes the column width in as --tree-gap so the
+   lines cannot drift away from the space they are drawn in.
+   --------------------------------------------------------------------------- */
+.treeCell {
+  position: relative;
+}
+
+/* what the missing row gap would have given */
+.treeCell > .button {
+  margin-top: 3px;
+  margin-bottom: 3px;
+}
+
+/* The panel the tree sits on, heading included so the words share its background
+   with no join between them. Sepia rather than a neutral grey, and darker than
+   the schematic canvas showing through the menu behind it, so the tree reads as
+   its own object rather than as a lighter patch of the same thing. */
+.treePanel {
+  background-color: #efe6d6;
+  border-radius: 6px;
+  padding: 14px 18px;
+}
+
+/* Space between one root hierarchy and the next - but not under the last, where
+   it would show as a band of bare panel below the tree. */
+.treeRoot {
+  margin-bottom: 30px;
+}
+
+.treeRoot:last-child {
+  margin-bottom: 0;
+}
+
+/* The trunk stands midway across the column gap, so there is room for a stub out
+   of the parent on one side and an elbow into the child on the other. Those two
+   meet the pills themselves: the cells have no padding, so a cell edge is a pill
+   edge. */
+.treeCell {
+  --tree-half: calc(var(--tree-gap, 20px) / 2);
+  --tree-line: 2px solid #9aa0a6;
+}
+
+/* the elbow, from the trunk across to the child */
+.treeNode::before {
+  content: "";
+  position: absolute;
+  left: calc(-1 * var(--tree-half));
+  width: var(--tree-half);
+  top: 50%;
+  border-top: var(--tree-line);
+}
+
+/* the trunk, joining the first child to the last */
+.treeNode::after {
+  content: "";
+  position: absolute;
+  left: calc(-1 * var(--tree-half));
+  border-left: var(--tree-line);
+}
+
+.treeFirst::after  { top: 50%; bottom: 0; }
+.treeMiddle::after { top: 0;   bottom: 0; }
+.treeLast::after   { top: 0;   height: 50%; }
+/* an only child has no siblings to join, so its parent's stub and its own elbow
+   meet in the middle of the gap and make one straight line */
+.treeOnly::after   { content: none; }
+
+/* out of the parent's right edge, as far as the trunk */
+.treeStub {
+  position: absolute;
+  right: calc(-1 * var(--tree-half));
+  width: var(--tree-half);
+  top: 50%;
+  border-top: var(--tree-line);
+}
+
+/* A tree of any size makes its dropdown far wider than the ordinary items above
+   it, and those items put their shortcut against the right edge - so New Sheet's
+   Ctrl+N would end up an arm's length from the words. Cap them: it costs nothing
+   in the menus that have no tree, which are narrower than this anyway. */
+#TopMenu .navbar-dropdown:has(.treeCell) > .navbar-item {
+  max-width: 20em;
+}
+
+/* ---------------------------------------------------------------------------
+   Properties pane button spacing.
+
+   Buttons there are stacked with <br> between them, which breaks the line but
+   adds no space, and Bulma gives .button no margin at all - so a column of
+   buttons touches, edge to edge. A margin here rather than at each call site,
+   since every one of them would otherwise have to remember it. Scoped to the
+   properties pane: the top bar packs its buttons tight on purpose, and the
+   wave simulator's toolbars are laid out to fixed widths.
+   --------------------------------------------------------------------------- */
+#PropertiesPane .button {
+  margin: 0.2rem 0.4rem 0.2rem 0;
+}
+
+/* ---------------------------------------------------------------------------
+   Recent projects: the cross that takes one off the list.
+
+   Faint rather than hidden-until-hover: a control nobody can see is one nobody
+   knows is there, and this list is the first thing a returning user looks at.
+   It darkens with the row and turns red under the pointer, so what it will act
+   on is never in doubt - the rows are close together and the wrong one is one
+   project's worth of annoyance.
+   --------------------------------------------------------------------------- */
+.recentItem {
+  display: flex;
+  align-items: center;
+}
+
+.recentItem .recentForget {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  padding: 0 2px;
+  color: #d0d0d0;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.recentItem:hover .recentForget {
+  color: #8a8a8a;
+}
+
+.recentItem .recentForget:hover {
+  color: #cc0f35;
+}
+
+/* ---------------------------------------------------------------------------
+   Property blocks: one per named property, in the sheet's properties and on a
+   custom component instance.
+
+   These were four-column tables. The pane is about 420px wide, so a description
+   - the thing a property most needs to be read - got a hundred of them and
+   wrapped to four lines beside a value that needed twelve. Each property is now
+   a block down the pane, so the description has the full width, and the block
+   is what separates one property from the next.
+
+   Light, not a card: a pane made of heavy boxes reads as a list of dialogs. A
+   hairline and a tinted ground are enough to say "these lines belong together"
+   without competing with the pane's own headings.
+   --------------------------------------------------------------------------- */
+.propertyBlock {
+  border: 1px solid #e6e6e6;
+  border-radius: 4px;
+  background: #fcfcfc;
+  padding: 0.45rem 0.55rem 0.35rem;
+  margin-bottom: 0.45rem;
+}
+
+/* The heading of an instance's property block: "name: what it means", the name
+   bold and nothing else about it different, so it reads as one sentence rather
+   than a title with a caption under it. It wraps like prose. */
+.propertyHead {
+  word-break: break-word;
+  line-height: 1.35;
+}
+
+/* The "Field: value" rows of a sheet's own property block, as a two-column grid.
+   The labels are what the table's column headings became - with no columns left
+   to head, each row has to say which field it is - and they are right-aligned
+   against one left edge that every value starts from. Left to their own widths
+   ("Property name:" is three times "Value:") the three values began at three
+   different places, and one record read as three unrelated fragments.
+
+   The labels are set apart by colour alone. Shrinking them made a block of six
+   sizes; a field name is not less worth reading than the value beside it. */
+.propertyFields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 0.4rem;
+  row-gap: 0.15rem;
+  align-items: baseline;
+  line-height: 1.35;
+}
+
+.propertyLabel {
+  color: #6b6b6b;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.propertyName {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+/* Tabular figures so a value does not jitter as its digits change. */
+.propertyValue {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The "in" and "out" of the Ports summary: the same field-label treatment as a
+   property's, grey and the same size as what it labels. */
+.portGroupLabel {
+  flex: 0 0 auto;
+  width: 34px;
+  color: #6b6b6b;
+}
+
+/* Nothing has settled this value yet: it is a placeholder, and says so. */
+.propertyValue.isPlaceholder {
+  color: #8a8a8a;
+  font-style: italic;
+}
+
+.propertyMeans {
+  color: #6b6b6b;
+  word-break: break-word;
+}
+
+/* The buttons sit under the block they act on rather than in a column of their
+   own. #PropertiesPane .button already carries the right margins. */
+.propertyControls {
+  margin-top: 0.15rem;
+}
+
+/* ---------------------------------------------------------------------------
+   The message under a property's input box.
+
+   It is recomputed on every keystroke, so it appears and disappears while the
+   user is typing. Given no height of its own it took one away from the block
+   each time it went, and everything below - the next property, the buttons -
+   walked up and down the pane under the pointer. The line is therefore always
+   there and only sometimes has words in it.
+   --------------------------------------------------------------------------- */
+.propertyMessage {
+  min-height: 1.3em;
+  line-height: 1.3;
+  margin-top: 0.15rem;
+  color: #cc0f35;
+}
+
+/* A block ends at its last control. Fulma gives every field a bottom margin for
+   the gap between fields, but inside a block the gap is the block's own padding
+   and the message line under the box; the controls row likewise reserves nothing
+   when it holds no button. Without these a property carried two blank lines. */
+.propertyBlock .field {
+  margin-bottom: 0;
+}
+
+.propertyControls:empty {
+  margin-top: 0;
+}
+
+/* The "= 8" beside a box is a static addon, not something to press, and it is
+   only there when the box holds an expression rather than a number. Given the
+   pane's button margins it made the row 6px taller the moment it appeared -
+   which is a reflow on the keystroke that turns "8" into "8*2", exactly when the
+   user is typing. It is a readout: no margin, so the row is one height.
+
+   Qualified by #PropertiesPane because that is how the margin it is overriding
+   is written, and an id outranks any number of classes. */
+#PropertiesPane .propertyBlock .button.is-static {
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   The "Expression syntax" link under an expression box.
+
+   It belongs to the box, and shows only while that box has focus - a line under
+   every width box in the pane is a line nobody asked for until they are
+   actually typing in one. :focus-within rather than a flag in the model: this
+   is a presentational state of one field, and routing it through Elmish would
+   put a message on every focus and blur in the pane.
+
+   It stays visible once opened, whether or not focus is still in the field, so
+   that reading it does not close it - clicking the text inside would otherwise
+   move focus out and take the thing being read away.
+   --------------------------------------------------------------------------- */
+.expressionSyntax {
+  display: none;
+  font-size: 11.5px;
+  margin-top: 0.15rem;
+}
+
+.paramField:focus-within > .expressionSyntax,
+.paramField > .expressionSyntax[open] {
+  display: block;
+}
+
+/* A link, not a disclosure: no triangle, and the underline and colour a link
+   has. The marker needs killing twice - `list-style` for the standard rendering
+   of a summary as a list item, and the -webkit- pseudo-element for Chromium's
+   own, which ignores it. */
+.expressionSyntax > summary {
+  cursor: pointer;
+  color: #3273dc;
+  text-decoration: underline;
+  list-style: none;
+  display: inline-block;
+}
+
+.expressionSyntax > summary::-webkit-details-marker {
+  display: none;
+}
+
+.expressionSyntaxBody {
+  line-height: 1.45;
+  color: #4a4a4a;
+  margin-top: 0.35rem;
+  padding-left: 0.5rem;
+  border-left: 2px solid #ececec;
+}
+
+.expressionSyntaxBody p {
+  margin-bottom: 0.4rem;
+}
+
+/* Inline code in the note is an expression: the same monospace it would be
+   typed in, so `w*2` cannot be mistaken for prose. */
+.expressionSyntaxBody code {
+  font-family: monospace;
+  background: #f2f2f2;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+
+/* ---------------------------------------------------------------------------
+   Project browser: the row the keyboard is on.
+
+   Bulma's is-active for a menu row is a solid #485fc7 with white text, which
+   assumes the row is one piece of plain text. These rows are not: the name, the
+   sheet count and the "no project file" warning each carry their own colour, and
+   those colours are the information - dimgrey says "ordinary folder, you can go
+   in", orange says "loadable, but the marker is missing". Bulma's rule recolours
+   only what inherits, so the name went white while the notes stayed grey and
+   orange on dark blue, at which point the row that was meant to stand out was
+   the one hardest to read.
+
+   A pale wash keeps every one of those colours legible and still reads as
+   selected; the bar down the left says which row it is without depending on
+   telling two near-white backgrounds apart.
+   --------------------------------------------------------------------------- */
+.projectBrowserList .menu-list a.is-active {
+  background-color: #eaf0fb;
+  color: #363636;
+  box-shadow: inset 3px 0 0 #485fc7;
+}
+
+/* Hover must not cancel the selection: whitesmoke over the wash would make the
+   selected row look unselected for as long as the pointer sat on it. */
+.projectBrowserList .menu-list a.is-active:hover {
+  background-color: #dfe8f8;
+}
+
+/* ---------------------------------------------------------------------------
+   A key on the keyboard, where prose tells the user to press one. Drawn as a
+   cap rather than set in bold, so that "press Ctrl and Alt and minus" is read
+   as three keys at a glance instead of parsed out of a sentence - and so the
+   minus and plus signs, which are one character each and vanish inside running
+   text, are as visible as the words beside them.
+
+   Sized in em, so a cap tracks whatever text it sits in; the border and the
+   inset highlight are what make it a key rather than a box.
+   --------------------------------------------------------------------------- */
+.keyCap {
+  display: inline-block;
+  min-width: 1.2em;
+  padding: 0 0.25em;
+  border: 1px solid #b5b5b5;
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  background-color: #fafafa;
+  box-shadow: inset 0 -1px 0 #ffffff;
+  font-family: inherit;
+  font-size: 0.78em;
+  font-weight: 600;
+  line-height: 1.5;
+  text-align: center;
+  color: #363636;
+}
+
+/* The + between two caps: quieter than the caps themselves, since it is not a
+   key to press but the instruction to hold them together. */
+.keyCapPlus {
+  padding: 0 0.05em;
+  font-size: 0.78em;
+  color: #7a7a7a;
+}

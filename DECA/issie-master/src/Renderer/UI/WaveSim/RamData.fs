@@ -1,0 +1,129 @@
+﻿/// Asking the .NET simulator for what a RAM table draws.
+///
+/// **There is no cache here, and there does not need to be.** The rows are small - at most a
+/// hundred a table - so they live in the model, in `WaveSimModel.RamRows`, and the view reads them
+/// the way it reads everything else. That is not a stylistic preference: the waveform pane is
+/// memoised on the model, so a reply landing in a module of its own changes nothing the renderer
+/// can see, and the table stays empty until something unrelated happens to redraw it. Held in the
+/// model, arriving IS a redraw.
+///
+/// The waveform data proper is the case that genuinely cannot do this and lives outside
+/// (`WaveData`): megabytes of typed arrays, read per render, per wave.
+///
+/// What is left here is the asking - which belongs in the update function and not in a render, so
+/// that a request is made when the question changes rather than on every frame.
+module RamData
+
+open Fable.Core
+open CommonTypes
+open ModelType
+open ModelHelpers
+open RamView
+open Optics
+open Optics.Operators
+
+/// What the table for one RAM is going to ask for, taken from the model.
+///
+/// Here rather than in the view because the fetch and the render must agree exactly: a key
+/// computed two ways is a table that asks for one thing, is sent it, and then reads the model for
+/// another - which looks exactly like a reply that never arrived.
+///
+/// `SparseUpTo` is zero when the user has typed a start address, since that is a request for a
+/// window whatever the memory holds - and asking for a listing that will be thrown away is a read
+/// that need not happen.
+///
+/// **A read-only memory's key carries no cycle.** What a ROM holds is part of its type and cannot
+/// change as the simulation runs, so rows read at any cycle are the rows at every cycle. The key is
+/// what decides whether they must be read again - it is part of the data viewport, so any change to
+/// it refetches - and carrying the cursor's cycle in it meant every cursor move re-read every ROM on
+/// screen, which on a design whose ROM is its program is most of the fetching there was. What DOES
+/// move is the location being read, and the table marks that itself from the address wave
+/// (`WaveSimRams.markReadLocally`), which travels with the waveforms.
+///
+/// The cycle a ROM's table SAYS it is showing is the cursor's, not this - WaveSimRams draws the
+/// cursor's cycle for a read-only memory precisely because the rows are of every cycle.
+let keyOf (model: Model) (ram: FComponentId) : RamKey =
+    // waveSimModel_ throughout, not getWSModel: the two index the WaveSim map by different
+    // fields - WaveSimOrCurrentSheet and WaveSimSheet - and where they disagree the rows would be
+    // written to one entry and looked for in the other, which reads as a reply that never came
+    // and asks again on every render.
+    let ws = Optic.get waveSimModel_ model
+    let typed, start =
+        Map.tryFind ram ws.RamStartLocation |> Option.defaultValue ("", 0I)
+
+    { Cycle =
+        if EvilHoverCache.isReadOnlyMemory (Simulator.getFastSim ()) ram then
+            0
+        else
+            ws.CursorExactClkCycle
+      SparseUpTo = (if typed = "" then WaveSimTypes.Constants.maxRamLocsWithSparseDisplay else 0)
+      Start = start }
+
+/// The rows held for one RAM, if they answer exactly the question the table is asking.
+let held (model: Model) (ram: FComponentId) : RamView option =
+    match Map.tryFind ram (Optic.get waveSimModel_ model).RamRows with
+    | Some(heldKey, view) when heldKey = keyOf model ram -> Some view
+    | _ -> None
+
+/// The rows held for one RAM, whatever question they answer.
+///
+/// What the table DRAWS, as against what it asks for. A table that draws nothing until the rows
+/// for the cycle it is on arrive flickers empty on every cursor move - and with two memories
+/// selected it flickers twice, since a pass fetches one of them and the next pass the other. The
+/// waveforms beside it have always behaved the other way round: they keep the last window that
+/// arrived and are redrawn when the next one does, because a viewer that empties itself while its
+/// data is in the air is what a broken viewer looks like.
+///
+/// The rows carry the cycle they are of, and the table says which that is, so nothing on screen
+/// claims to be of a cycle it is not.
+let heldAny (model: Model) (ram: FComponentId) : (RamKey * RamView) option =
+    Map.tryFind ram (Optic.get waveSimModel_ model).RamRows
+
+/// Whether this memory's rows have to be asked for: nothing held answers the question the table is
+/// about to ask.
+///
+/// One comparison for both kinds of memory, because whether a ROM's contents depend on the cycle is
+/// settled in the KEY (see `keyOf`) rather than tested again here. It was tested in both places, and
+/// only one of them was consulted by the code that actually fetches.
+let needed (model: Model) (ram: FComponentId) = (held model ram).IsNone
+
+/// Of these memories and the keys their tables are asking under, the ones whose rows are not
+/// already held for exactly that key.
+///
+/// A fetch reads everything the viewport covers, and a viewport changes whenever ANY of it does -
+/// so a scroll, which moves the waveform window and nothing else, asked for every selected memory's
+/// rows again. Skipping what is already held keeps the memoisation obligation intact: `FetchedData
+/// = snapshot` claims the caches hold what the snapshot needs, and rows held under exactly that key
+/// are what that claims.
+let notHeld (model: Model) (rams: (FComponentId * RamKey) list) =
+    rams
+    |> List.filter (fun (ram, key) -> (heldAny model ram |> Option.map fst) <> Some key)
+
+/// Read one RAM's rows from the sidecar, for the update function to put in the model.
+///
+/// The reply carries the epoch it was asked of, and whether that is still the session on screen is
+/// settled where the model is, when the completion message lands. A build since then means these
+/// rows describe a simulation that is no longer the one being drawn, and they would look exactly
+/// as trustworthy as ones that did.
+///
+/// **A failure is returned, not logged.** It used to answer `None` for both "no rows" and "the read
+/// failed", and the caller could then only drop it - which made the whole fetch report success,
+/// which recorded the viewport as served, which meant the memoisation claim of section J was false
+/// and nothing ever asked again. A table stayed empty or a cycle out of date for as long as the
+/// view did not move, with a console warning as the only sign.
+let fetch
+    (epoch: int)
+    (ram: FComponentId)
+    (key: RamKey)
+    (rows: int)
+    : JS.Promise<Result<FComponentId * (RamKey * RamView), SidecarClient.SidecarFailure>> =
+    let (ComponentId cid), path = ram
+    let pathIds = path |> List.map (fun (ComponentId p) -> p)
+
+    promise {
+        let! reply = SidecarClient.simReadRam epoch key.Cycle cid pathIds key.SparseUpTo key.Start rows
+
+        match reply with
+        | Error e -> return Error(SidecarClient.prefixFailure $"reading memory {cid}" e)
+        | Ok view -> return Ok(ram, (key, view))
+    }

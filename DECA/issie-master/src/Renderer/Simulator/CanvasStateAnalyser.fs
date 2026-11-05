@@ -1,0 +1,842 @@
+module CanvasStateAnalyser
+
+(*
+    CanvasStateAnalyser.fs
+
+    This module collects a series of functions that perform checks on
+    CanvasState and SimulationGraph.
+*)
+
+open EEExtensions
+open CommonTypes
+open SimGraphTypes
+open BusWidthInferer
+open ParameterTypes
+
+// -- Checks performed
+//
+// Ports constraints:
+// - Source ports must be output ports.
+// - Target ports must be input ports.
+// - All ports have at least one connection that touches them.
+// - Input ports have precisely one connection that touches them.
+// - Custom components must have I/Os consistent with the sheet that defines them.
+//
+// Input/Output components in a simulationgraph must all have unique labels.
+//
+// All wire widths are consistent (rely on WidthInferer.fs).
+
+// IOLabel input and output ports are special.
+// Input: each same label group must be driven just once.
+// Output: relax normal restriction that all outputs must be connected
+
+/// Return all the Ids of all input ports across all components.
+/// Return also the ComponentId which may be used in error messages.
+
+type MapData =
+    { Connections: Connection list
+      Components: Component list
+      LabComp: Component list
+      LabGroup: Map<string, Component list>
+      LabInputPorts: Port list
+      LabOutputPorts: Port list
+      LabTargetConns: Connection list
+      OtherTargetConns: Connection list
+      LabSourceConns: Connection list
+      OtherSourceConns: Connection list
+      OtherInputPorts: Port list
+      OtherOutputPorts: Port list
+      ToComp: Map<ComponentId, Component>
+      ToInputPort: Map<InputPortId, Port>
+      ToOutputPort: Map<OutputPortId, Port> }
+
+/// Input and Output names of the ports depending on their ComponentType
+let portNames (componentType:ComponentType)  = //(input port names, output port names)
+    match componentType with
+    | Decode4 -> (["SEL";"DATA"],["0"; "1";"2"; "3"])
+    | NbitsAdder _ -> (["CIN";"P";"Q"],["SUM "; "COUT"])
+    | NbitsAdderNoCin _ -> (["P";"Q"],["SUM "; "COUT"])
+    | NbitsAdderNoCinCout _ -> (["P";"Q"],["SUM "])
+    | NbitsAdderNoCout _ -> (["CIN";"P";"Q"],["SUM "])
+    | Register _ -> (["D"],["Q"])
+    | RegisterE _ -> (["D"; "EN"],["Q"])
+    | Counter _ -> (["D"; "LOAD"; "EN"],["Q"])
+    | CounterNoEnable _ -> (["D"; "LOAD"],["Q"])
+    | CounterNoLoad _ -> (["EN"],["Q"])
+    | CounterNoEnableLoad _ ->  ([],["Q"])
+    | ROM1 _ |AsyncROM1 _ -> (["ADDR"],["DOUT"])
+    | RAM1 _ -> (["ADDR"; "DIN";"WEN" ],["DOUT"])
+    | AsyncRAM1 _ -> (["ADDR"; "DIN";"WEN" ],["DOUT"])
+    | DFF -> (["D"],["Q"])
+    | DFFE -> (["D";"EN"],["Q"])
+    | Mux2 -> (["0"; "1";"SEL"],["OUT"])
+    | MergeN nInp -> (List.init nInp (fun i -> 
+        match i with
+        | n when n = 0 -> "LSB"
+        | n when n = nInp-1 -> "MSB"
+        | _ -> ""), ["OUT"])
+    | SplitN (n, _, _) -> (["IN"], [])
+    | Mux4 -> (["0"; "1"; "2"; "3" ;"SEL"],["OUT"])
+    | Mux8 -> (["0"; "1"; "2" ; "3" ; "4" ; "5" ; "6" ; "7";"SEL"],["OUT"])
+    | Demux2 -> (["DATA" ; "SEL"],["0"; "1"])
+    | Demux4 -> (["DATA"; "SEL"],["0"; "1";"2"; "3";])
+    | Demux8 -> (["DATA"; "SEL"],["0"; "1"; "2" ; "3" ; "4" ; "5" ; "6" ; "7"])
+    | NbitsXor _ | NbitsAnd _ | NbitsOr _ -> (["P"; "Q"], ["OUT"])
+    | NbitsNot _ | NbitSpreader _ -> (["IN"],["OUT"])
+    | Shift _ -> (["IN" ; "SHIFT"],["OUT"])
+    | Custom x -> (List.map fst x.InputLabels), (List.map fst x.OutputLabels)
+    // Array design sheet IO. Each has one port and the symbol's own label names it, so a port name
+    // would only repeat what is already drawn - as it would on an Input1 or an Output, which have
+    // none either.
+    | BusOut _ | MuxOut _ | JoinOut _ | JoinIn _ -> ([],[])
+    // The glue an expanded array design sheet leaves behind. Named as MergeN and Mux2 are, because
+    // the waveform viewer shows their ports even though no canvas ever draws one.
+    | ArrayMerge n ->
+        (List.init n (fun i ->
+            if i = 0 then "LSB" elif i = n - 1 then "MSB" else ""), ["OUT"])
+    | ArrayMux n ->
+        (List.init n string @ ["SEL"], ["OUT"])
+    | _ -> ([],[])
+   // |Demux8 -> (["IN"; "SEL"],["0"; "1"; "2" ; "3" ; "4" ; "5" ; "6" ; "7"])
+   // |_ -> ([],[])
+   // EXTENSION: Extra Components made that are not currently in Issie. Can be extended later by using this code as it is .
+
+let getPortName (comp:Component) (port: Port) =
+    let pNames = portNames comp.Type
+    let getIdx pList =
+        List.tryFindIndex (fun (po: Port) -> po.Id = port.Id) pList
+        |> function
+            | Some i -> i
+            | None -> failwith "getPortName: Port not contained in given list"
+    match port.PortType with
+    | PortType.Input ->
+        List.tryItem (getIdx comp.InputPorts) (fst pNames)
+    | PortType.Output ->
+        let idx = List.tryFindIndex (fun (po: Port) -> po.Id = port.Id) comp.OutputPorts
+        List.tryItem (getIdx comp.OutputPorts) (snd pNames)
+    |> function
+        | Some name -> name
+        | None -> ""
+
+let private getAllInputPortIds (components: Component list) : (InputPortId * ComponentId) list =
+    components
+    |> List.collect (fun comp ->
+        comp.InputPorts
+        |> List.map (fun port -> InputPortId port.Id, comp.Id))
+
+/// Return all the Ids of all ouput ports across all components.
+/// Return also the ComponentId which may be used in error messages.
+let private getAllOutputPortIds (components: Component list) : (OutputPortId * ComponentId) list =
+    components
+    |> List.collect (fun comp ->
+        comp.OutputPorts
+        |> List.map (fun port -> OutputPortId port.Id, comp.Id))
+
+/// maps for use in various places
+let private genMaps ((comps, conns): CanvasState) =
+
+    let labComps: Component list = List.filter (fun co -> co.Type = IOLabel) comps
+
+    let idToComp =
+        comps
+        |> List.map (fun co -> co.Id, co)
+        |> Map.ofList
+
+    let targetIsLabel (c: Connection) =
+        idToComp[c.Target.HostId].Type = IOLabel
+
+    let sourceIsLabel (c: Connection) =
+        idToComp[c.Source.HostId].Type = IOLabel
+
+    let splitBy pred lst =
+        (([], []), lst)
+        ||> List.fold (fun (is, isNot) x ->
+            if pred x then
+                (x :: is, isNot)
+            else
+                (is, x :: isNot))
+
+    let labTargetConns, otherTargetConns = splitBy targetIsLabel conns
+    let labSourceConns, otherSourceConns = splitBy sourceIsLabel conns
+
+    let normalise (p: Port) = { p with PortNumber = None }
+    let normaliseL (pL: Port list) = List.map normalise pL
+
+    let idToInputPort =
+        comps
+        |> List.collect (fun co -> co.InputPorts)
+        |> List.map (fun po -> InputPortId po.Id, normalise po)
+        |> Map.ofList
+
+    let idToOutputPort =
+        comps
+        |> List.collect (fun co -> co.OutputPorts)
+        |> List.map (fun po -> OutputPortId po.Id, normalise po)
+        |> Map.ofList
+
+    let otherInputPorts =
+        comps
+        |> List.filter (fun co -> co.Type <> IOLabel)
+        |> List.collect (fun co -> normaliseL co.InputPorts)
+
+    let otherOutputPorts =
+        comps
+        |> List.filter (fun co -> co.Type <> IOLabel)
+        |> List.collect (fun co -> normaliseL co.OutputPorts)
+
+    let labGroup =
+        List.groupBy (fun (co: Component) -> co.Label) labComps
+        |> Map.ofList
+
+    let labInputPorts =
+        labComps
+        |> List.collect (fun co -> normaliseL co.InputPorts)
+
+    let labOutputPorts =
+        labComps
+        |> List.collect (fun co -> normaliseL co.OutputPorts)
+
+    { Connections = conns
+      Components = comps
+      LabComp = labComps
+      LabGroup = labGroup
+      OtherInputPorts = otherInputPorts
+      OtherOutputPorts = otherOutputPorts
+      LabInputPorts = labInputPorts
+      LabOutputPorts = labOutputPorts
+      ToComp = idToComp
+      ToInputPort = idToInputPort
+      ToOutputPort = idToOutputPort
+      LabTargetConns = labTargetConns
+      LabSourceConns = labSourceConns
+      OtherTargetConns = otherTargetConns
+      OtherSourceConns = otherSourceConns }
+
+/// Check that:
+/// 1- all source ports in connections are Output ports,
+/// 2- all target ports in connections are Input ports,
+/// 3- all input ports in a component are actually input ports,
+/// 4- all output ports in a component are actually output ports,
+/// 5- all ports on components have a port number,
+/// 6- all ports on connection do not have a port number.
+/// These conditions should always hold, unless there are bugs in the code (i.e.
+/// no user behaviour should be able to trigger such errors).
+/// The costruction of the Simulation graph assumes that these rules hold.
+/// TODO: should they crash the program then?
+let private checkPortTypesAreConsistent (canvasState: CanvasState) : SimulationError option =
+    let rec checkComponentPorts (ports: Port list) (correctType: PortType) =
+        match ports with
+        | [] -> None
+        | port :: _ when port.PortNumber = None ->
+            Some
+                { ErrType = PortNumMissing correctType
+                  InDependency = None
+                  ComponentsAffected = [ port.HostId ]
+                  ConnectionsAffected = [] }
+        | port :: _ when port.PortType <> correctType ->
+            Some 
+                { ErrType = WrongPortType (correctType, port)
+                  InDependency = None
+                  ComponentsAffected = [ port.HostId ]
+                  ConnectionsAffected = [] }
+        | _ :: ports' -> checkComponentPorts ports' correctType
+
+    /// Check conditions 3, 4, 5
+    let rec checkComponentsPorts (components: Component list) =
+        match components with
+        | [] -> None
+        | comp :: components' ->
+            match
+                checkComponentPorts comp.InputPorts PortType.Input, checkComponentPorts comp.OutputPorts PortType.Output
+            with
+            | Some err, _
+            | _, Some err -> Some err
+            | None, None -> checkComponentsPorts components' // Check next.
+
+    let checkConnectionPort (port: Port) (correctType: PortType) (connId: ConnectionId) =
+        match port.PortType = correctType, port.PortNumber with
+        | false, _ ->
+            Some
+                { ErrType = WrongPortType (correctType, port)
+                  InDependency = None
+                  ComponentsAffected = [ port.HostId ]
+                  ConnectionsAffected = [ connId ] }
+        | _, Some portNumber ->
+            Some
+                { ErrType = ConnTypeHasNum (correctType, portNumber)
+                  InDependency = None
+                  ComponentsAffected = [ port.HostId ]
+                  ConnectionsAffected = [ connId ] }
+        | true, None -> None // All right.
+
+    /// Check conditions 1, 2, 6
+    let rec checkConnectionsPorts (connections: Connection list) =
+        match connections with
+        | [] -> None
+        | conn :: connections' ->
+            match
+                checkConnectionPort conn.Source PortType.Output conn.Id,
+                checkConnectionPort conn.Target PortType.Input conn.Id
+            with
+            | Some err, _
+            | _, Some err -> Some err
+            | None, None -> checkConnectionsPorts connections' // Check next.
+
+    let components, connections = canvasState
+
+    match checkComponentsPorts components, checkConnectionsPorts connections with
+    | Some err, _
+    | _, Some err -> Some err
+    | None, None -> None // All right.
+
+/// Apply condition on every element of the map (tailored to this specific
+/// problem).
+let private checkEvery
+    (counts: Map<'b, (Connection list * int)>) // keyed by port id, or by label name
+    (cond: int -> bool)
+    : ('b * ConnectionId list * int) option
+    =
+    (None, Map.toList counts)
+    ||> List.fold (fun maybeErr (idStr, (conns, count)) ->
+        match maybeErr with
+        | Some err -> Some err
+        | None ->
+            match cond count with
+            | true -> None
+            | false ->
+                Some
+                    ( idStr,
+                      conns
+                        |> List.map (fun conn -> conn.Id),
+                      count))
+
+/// Count the number of connections that target each port or group of label input ports
+let private countPortsConnections
+    (conns: Connection list)
+    (connMap: Connection -> 'b)
+    (bins: 'b list)
+    =
+    let rec countPortsConnections' (conns: Connection list) (counts: Map<'b, int * Connection list>) =
+        match conns with
+        | [] ->
+            counts
+            |> Map.toList
+            |> List.map (fun (key, (count, conns)) -> key, (conns, count))
+            |> Map.ofList
+        | conn :: conns' ->
+            let countsRes =
+                let key = connMap conn
+
+                // Hacky fix
+                match Map.tryFind key counts with
+                | Some(binCount, binConns) -> counts.Add(key, (binCount + 1, conn :: binConns))
+                | None -> counts
+
+            countPortsConnections' conns' countsRes
+
+    countPortsConnections'
+        conns
+        (bins
+         |> List.map (fun b -> b, (0, []))
+         |> Map.ofList)
+
+let private checkCounts (conns: Connection list) connMap bins binMap cond =
+    let totals = countPortsConnections conns connMap bins
+    checkEvery totals cond
+
+let getPortNum (pList: Port list) (port: Port) =
+    pList
+    |> List.tryFind (fun po -> po.Id = port.Id)
+    |> function
+        | Some po -> po.PortNumber
+        | None -> failwithf "port should be in given port list"
+
+let getRmInfoData m port =
+    let parentComp = m.ToComp[port.HostId]
+    let portNum =
+        getPortNum
+            (if port.PortType = PortType.Input then parentComp.InputPorts else parentComp.OutputPorts)
+            port
+    let portName = getPortName parentComp {port with PortNumber = portNum}
+    (parentComp, portName)
+
+let private getInPortRmInfo (m: MapData) (counts: Map<PortId, Connection list * int>) (port: Port) : PortRmInfo =
+    let parentComp, portName = getRmInfoData m port
+    let checkAllPorts (cond: int -> Port -> bool) (ports: Port list) =
+        ports
+        |> List.forall (fun port -> cond (snd counts[port.Id]) port)
+    
+    let condDisconnected count port =
+        match count with
+        | 0 -> true
+        | _ -> false
+    
+    let condSelDisconnected (portNumSelection: string list) (count: int) (port: Port) =
+        match (portNumSelection |> List.contains portName) with
+        | true -> condDisconnected count port
+        | false -> true
+
+    match parentComp.Type with
+    | NbitsAdder w ->
+        match portName with
+        | "CIN" -> Removable (NbitsAdderNoCin w) // must be CIN port
+        | _ -> Unremovable
+    | NbitsAdderNoCout w ->
+        match portName with
+        | "CIN" -> Removable (NbitsAdderNoCinCout w) // must be CIN port
+        | _ -> Unremovable
+    | CounterNoLoad w -> Removable (CounterNoEnableLoad w)
+    | CounterNoEnable w -> // check if both Load and D are disconnected because only both can be removed or none
+        match (checkAllPorts condDisconnected parentComp.InputPorts) with
+        | true -> Removable (CounterNoEnableLoad w)
+        | false -> Unremovable
+    | Counter w ->
+        let isDAndLoadDisconnected = checkAllPorts (condSelDisconnected ["D"; "LOAD"]) parentComp.InputPorts
+        let isEnDisconnected = checkAllPorts (condSelDisconnected ["EN"]) parentComp.InputPorts
+        match portName, isDAndLoadDisconnected, isEnDisconnected with
+        | "D", true, _ | "LOAD", true, _ -> Removable (CounterNoLoad w)
+        | "D", false, _ | "LOAD", false, _ -> Unremovable
+        | "EN", _, true -> Removable (CounterNoEnable w)
+        | "EN", _, false -> Unremovable
+        | _, false, false -> Unremovable
+        | _, _, _ -> failwith "Ports can never be connected like this"
+    | _ -> Unremovable
+
+
+let private getOutPortRmInfo (m: MapData) (counts: Map<PortId, Connection list * int>) (port: Port) : PortRmInfo =
+    let parentComp, portName = getRmInfoData m port
+    match parentComp.Type with
+    | NbitsAdder w ->
+        match portName with
+        | "COUT" -> Removable (NbitsAdderNoCout w)
+        | _ -> Unremovable
+    | NbitsAdderNoCin w ->
+        match portName with
+        | "COUT" -> Removable (NbitsAdderNoCinCout w)
+        | _ -> Unremovable
+    | _ -> Unremovable
+
+let private getInErrType count port rmInfo =
+    InputConnError (count, port, rmInfo)
+let getOutErrType count port rmInfo =
+    OutputConnError (count, port, rmInfo)
+
+let private checkPortConnections
+    (m: MapData)
+    (connMap: Connection -> PortId)
+    (bins: Port list)
+    (cond: int -> bool)
+    pidMap
+    rmInfoGen
+    errTypeGen
+    : SimulationError option
+    =
+    let counts =
+        countPortsConnections
+            m.Connections
+            connMap
+            (bins |> List.map (fun port -> port.Id))
+    
+    match checkEvery counts cond with
+    | Some (portId, connsAffected, count) ->
+        let port = pidMap portId
+        let rmInfo = rmInfoGen m counts port
+        Some {
+            ErrType = errTypeGen count port rmInfo
+            InDependency = None
+            ComponentsAffected = [port.HostId]
+            ConnectionsAffected = connsAffected
+        }
+    | None -> None
+
+let private checkConns (conns: Connection list) (m: MapData) : SimulationError option =
+    let compOfPort p = m.ToComp[p.HostId]
+
+    conns
+    |> List.tryPick (fun conn ->
+        let s = compOfPort conn.Source
+        let t = compOfPort conn.Target
+
+        if s.Type = IOLabel && t.Type = IOLabel then
+            Some(s, t, conn)
+        else
+            None)
+    |> Option.map (fun (s, t, conn) ->
+        {   ErrType = LabelConnect
+            InDependency = None
+            ComponentsAffected = [ s.Id; t.Id ]
+            ConnectionsAffected = [ conn.Id ] })
+
+/// Check that:
+/// - any port has at least one connection,
+/// - any input port has precisely one connection.
+/// These conditions may not hold due to user errors.
+let private checkPortsAreConnectedProperly (canvasState: CanvasState) =
+    let m = genMaps canvasState
+    let conns = m.Connections
+    let labMap (lab: string) = m.LabGroup[lab]
+
+    [
+      checkPortConnections
+        m
+        (fun conn -> conn.Target.Id)
+        m.OtherInputPorts
+        ((=) 1)
+        (fun pid -> m.ToInputPort[InputPortId pid])
+        getInPortRmInfo
+        getInErrType
+
+      match (checkCounts
+          m.LabTargetConns
+          (fun conn -> m.ToComp[conn.Target.HostId].Label)
+          (m.LabGroup |> Map.keysL)
+          (labMap)
+          ((=) 1)) with
+            | Some (labelId, connsAffected, count) ->
+                Some {
+                    ErrType = LabelConnError count
+                    InDependency = None
+                    ComponentsAffected = (labMap labelId) |> List.map (fun comp -> comp.Id)
+                    ConnectionsAffected = connsAffected
+                }
+            | None -> None
+
+      checkPortConnections
+        m
+        (fun conn -> conn.Source.Id)
+        m.OtherOutputPorts
+        ((<) 0)
+        (fun pid -> m.ToOutputPort[OutputPortId pid])
+        getOutPortRmInfo
+        getOutErrType
+
+      checkConns conns m
+
+      ]
+    |> List.tryPick id
+
+/// Input/Output components in a simulationgraph all have unique labels.
+let private checkIOLabels (canvasState: CanvasState) : SimulationError option =
+    let rec checkDuplicate (comps: Component list) (map: Map<string, ComponentId>) (ioType: string) =
+        match comps with
+        | [] -> None
+        | comp :: comps' ->
+            match map.TryFind comp.Label with
+            | None -> checkDuplicate comps' map ioType
+            | Some compId when compId = comp.Id -> checkDuplicate comps' map ioType
+            | Some compId ->
+                Some
+                    { ErrType = LabelDuplicate (ioType, comp.Label)
+                      InDependency = None
+                      ComponentsAffected = [ comp.Id; compId ]
+                      ConnectionsAffected = [] }
+
+    let toMap (comps: Component list) =
+        comps
+        |> List.map (fun comp -> comp.Label, comp.Id)
+        |> Map.ofList
+
+    let components, _ = canvasState
+
+    let inputs =
+        components
+        |> List.filter (fun comp ->
+            match comp.Type with
+            | Input1 _ -> true
+            | _ -> false)
+
+    let outputs =
+        components
+        |> List.filter (fun comp ->
+            match comp.Type with
+            // BusOut and MuxOut are outputs of an array design sheet, so their labels share the
+            // output name space with Output's and a clash between them is the same mistake
+            | Output _ | BusOut _ | MuxOut _ -> true
+            | _ -> false)
+
+    let labels =
+        components
+        |> List.filter (fun comp ->
+            match comp.Type with
+            | IOLabel -> true
+            | _ -> false)
+
+    match checkDuplicate inputs (toMap inputs) "Input", checkDuplicate outputs (toMap outputs) "Output" with
+    | Some err, _
+    | _, Some err -> Some err
+    | None, None -> None
+
+type CustomComponentError =
+    | NoSheet of string
+    | BadInputs of ComponentSheet: string * InstLists: ((string * int) list) * CompLists: ((string * int) list)
+    | BadOutputs of ComponentSheet: string * InstLists: ((string * int) list) * CompLists: ((string * int) list)
+
+/// <summary>
+/// Check a single custom component for correct I/Os, resolving parameters if necessary.
+/// </summary>
+/// <param name="c">The custom component instance to check</param>
+/// <param name="args">The custom component type containing parameter bindings and expected I/O labels</param>
+/// <param name="sheets">List of loaded component sheets to check against</param>
+/// <returns>
+/// Ok() if the component's I/Os match the sheet definition
+/// Error with details if there's a mismatch or missing sheet
+/// </returns>
+/// <remarks>
+/// The signature an instance ought to have is CanvasExtractor.signatureOfInstance: the sheet
+/// inside it, resolved at the bindings the instance gives. That is the same calculation the
+/// catalogue makes when placing an instance, the properties pane makes when a binding is edited,
+/// and CustomCompPorts makes when bringing instances back into step - one function, so those four
+/// cannot disagree about what an instance's ports are, as the copies they used to hold did.
+///
+/// The instance's bindings are read here on their own, with no parent sheet to evaluate them in,
+/// because a canvas is checked without reference to whatever contains it. A binding that is an
+/// expression in the parent's parameters therefore cannot be worked out, and the signature comes
+/// back inexact: only the port NAMES are then compared, and the widths are left to simulation
+/// elaboration, which has the parent's bindings and is exact. Comparing widths anyway would fail a
+/// design that is perfectly correct.
+/// </remarks>
+let checkCustomComponentForOkIOs (c: Component) (args: CustomComponentType) (sheets: LoadedComponent list) =
+    let name = args.Name
+    let compare labs1 labs2 = (labs1 |> Set) = (labs2 |> Set)
+
+
+    sheets
+    |> List.tryFind (fun sheet -> sheet.Name = name)
+    |> Option.map (fun sheet ->
+        let (resolvedInputs, resolvedOutputs), widthsKnown =
+            args.ParameterBindings
+            |> Option.defaultValue Map.empty
+            |> CanvasExtractor.signatureOfInstanceWithCertainty sheets Map.empty name
+            |> Option.defaultValue ((sheet.InputLabels, sheet.OutputLabels), true)
+
+        let names labs = labs |> List.map fst
+        let inputsMatch =
+            if widthsKnown then compare resolvedInputs args.InputLabels
+            else compare (names resolvedInputs) (names args.InputLabels)
+        let outputsMatch =
+            if widthsKnown then compare resolvedOutputs args.OutputLabels
+            else compare (names resolvedOutputs) (names args.OutputLabels)
+        // the error names the RESOLVED ports, not the sheet's declared ones: on a parameterised
+        // sheet the declared widths are not what this instance should have had, and quoting them
+        // sends the user to look at the wrong number
+        (resolvedInputs, resolvedOutputs), inputsMatch, outputsMatch)
+    |> function
+        | None -> Error(c, NoSheet name)
+        | Some(_, true, true) -> Ok()
+        | Some((ins, _), false, _) -> Error(c, BadInputs(name, ins, args.InputLabels))
+        | Some((_, outs), true, false) -> Error(c, BadOutputs(name, outs, args.OutputLabels))
+
+/// Custom components have I/Os which are the same (names) as the I/Os in the corresponding sheet
+/// This can change if a sheet made into a custom component is edited
+/// We do this check whenever a new sheet is opened
+let checkCustomComponentsOk ((comps, _): CanvasState) (sheets: LoadedComponent list) : SimulationError option =
+    let error (c: Component) (t: SimulationErrorType) =
+        Some
+            { ErrType = t
+              InDependency = None
+              ComponentsAffected = [ c.Id ]
+              ConnectionsAffected = [] }
+
+    let disp portL =
+        portL
+        |> List.map fst
+        |> String.concat " , "
+        |> sprintf "%s"
+
+    comps
+    |> List.collect (function
+        | { Type = Custom args } as c -> [ checkCustomComponentForOkIOs c args sheets ]
+        | _ -> [])
+    |> Helpers.ResultList.sequence
+    |> function
+        | Ok _ -> None
+        | Error(c, NoSheet cName) ->
+            error c (MissingSheet cName)
+        | Error(c, BadInputs(cName, instIns, compIns)) ->
+            let instIns, compIns = disp instIns, disp compIns
+            error c (InPortMismatch (cName, instIns, compIns))
+        | Error(c, BadOutputs(cName, instOuts, compOuts)) ->
+            let instOuts, compOuts = disp instOuts, disp compOuts
+
+            error c (OutPortMismatch (cName, instOuts, compOuts))
+
+/// Check whether Adders have a NotConnected component connected to their COUT
+/// this is unnecessary since it can be disabled via its options
+let checkAdderUnnecessaryNC ((comps, conns): CanvasState) : SimulationError option =
+    let isNotConnected id =
+        comps
+        |> List.exists (fun comp ->
+            comp.Id = id && comp.Type = NotConnected)
+    
+    let getNCConnectedOutPorts (outPortsList: Port list) =
+        outPortsList
+        |> List.filter (fun port ->
+            conns
+            |> List.exists (fun conn ->
+                conn.Source.Id = port.Id && isNotConnected conn.Target.HostId))
+
+    let affectedPorts =
+        comps
+        |> List.filter (function comp ->
+                                    match comp.Type with
+                                    | NbitsAdder _ | NbitsAdderNoCin _ -> true
+                                    | _ -> false) // only check adders with COUT
+        |> List.collect (fun comp -> getNCConnectedOutPorts comp.OutputPorts)
+        |> List.filter (fun port -> (Option.get port.PortNumber) <> 0) // ignore SUM port
+    
+    
+
+    match affectedPorts with
+        | [] -> None
+        | affPorts ->
+            let affectedComps =
+                affPorts
+                |> List.map (fun port -> port.HostId)
+            
+            let affectedConns =
+                conns
+                |> List.filter (fun conn ->
+                    affPorts
+                    |> List.exists (fun port ->
+                        port.Id = conn.Source.Id))
+                |> List.map (fun conn -> conn.Id)
+            Some {
+                ErrType = UnnecessaryNC
+                InDependency = None
+                ComponentsAffected = affectedComps
+                ConnectionsAffected = affectedConns
+            }
+
+/// Checks that all connections have consistent widths.
+/// This function relies on the bus inferer, but also makes sure that all widths
+/// can be inferred.
+let private checkConnectionsWidths (canvasState: CanvasState) : SimulationError option * ConnectionsWidth option =
+    let convertConnId (ConnectionId cId) = ConnectionId cId
+    let convertError (err: WidthInferError) : SimulationError =
+        { ErrType = WidthMismatch err
+          InDependency = None
+          ConnectionsAffected = err.ConnectionsAffected |> List.map convertConnId
+          ComponentsAffected = [] }
+    match inferConnectionsWidth canvasState with
+    | Error err -> Some <| convertError err, None
+    | Ok connWidths ->
+        let faulty =
+            connWidths
+            |> Map.filter (fun _ width -> Option.isNone width)
+        match faulty.IsEmpty with
+        | true -> None, Some connWidths // All good.
+        | _ ->
+            Some
+                { ErrType = InferConnWidths "Could not infer all connections widths."
+                  InDependency = None
+                  ConnectionsAffected =
+                    faulty
+                    |> Map.toList
+                    |> List.map (fun (cId, _) -> convertConnId cId)
+                  ComponentsAffected = [] },
+            None
+
+/// check component labels are all unique and do not include protected values (CLK)
+let checkComponentNamesAreOk ((comps, conns): CanvasState) =
+    let badNameErrors =
+        comps
+        |> List.filter (function
+            | { Type = MergeWires }
+            | { Type = SplitWire _ }
+            | { Type = BusSelection _ }
+            | { Type = NotConnected } -> false
+            | _ -> true)
+        |> List.collect (fun comp ->
+            let label = comp.Label.ToUpper()
+
+            match label with
+            | "CLK" ->
+                [ comp,
+                  "Clk is not allowed as a name for a component or a Net. \
+                        Use the properties tab to give a different name to the highlighted component(s)." ]
+            | "" ->
+                [ comp,
+                  "All components must have a unique alphanumeric name (e.g. 'G1'). An empty name is not allowed except for split and join and bus select.\
+                        Use the properties tab to give a non-empty name to the highlighted component(s)." ]
+            | _ -> [])
+        |> List.groupBy snd
+        |> List.map (fun (msg, eLst) -> List.map fst eLst, msg)
+
+    let duplicateNameErrors =
+        comps
+        |> List.filter (function
+            | { Type = IOLabel }
+            // A join's label names a CHANNEL between the copies of an array sheet, not the
+            // component - exactly as a net label's does - so a JoinOut and the JoinIn that reads
+            // it share one, and a sheet may have several of each on one channel at different
+            // numbers. What must be distinct is the (label, number) pair on each side, which is a
+            // fact about the whole array and is checked with the other array rules.
+            | { Type = JoinOut _ }
+            | { Type = JoinIn _ }
+            | { Type = MergeWires }
+            | { Type = SplitWire _ }
+            | { Type = BusSelection _ }
+            | { Type = NotConnected } -> false
+            | _ -> true)
+        |> List.groupBy (fun comp -> comp.Label)
+        |> List.filter (fun (_, compL) -> List.length compL > 1)
+        |> List.map (fun (_, compL) ->
+            compL,
+            "Component names must be distinct. \
+                            Use the properties tab to give different names to the highlighted components")
+
+    List.tryHead (badNameErrors @ duplicateNameErrors)
+    |> Option.map (fun (comps, msg) ->
+        { ErrType = BadName msg
+          InDependency = None
+          ConnectionsAffected = []
+          ComponentsAffected =
+            comps
+            |> List.map (fun comp -> comp.Id) })
+
+/// The IO of an array design sheet, on a sheet that is not one.
+///
+/// By the time a canvas reaches here, every array design sheet has been replaced by the two
+/// ordinary sheets it expands to (ArrayElaborate) - so a BusOut, an MuxOut or a join surviving to
+/// this point is one on a sheet with no array settings, where there are no copies for it to mean
+/// anything about. That is how a component pasted onto an ordinary sheet, or left behind when a
+/// sheet stopped being an array sheet, is caught.
+///
+/// ArrayMerge and ArrayMux are deliberately not refused: expansion MAKES them, so they are
+/// perfectly legal here. What keeps them off a user's sheet is that the catalogue does not offer
+/// them and nothing can place one.
+let private checkArrayIOIsOnAnArraySheet ((comps, _): CanvasState) : SimulationError option =
+    comps
+    |> List.filter (fun comp ->
+        match comp.Type with
+        | BusOut _ | MuxOut _ | JoinOut _ | JoinIn _ -> true
+        | _ -> false)
+    |> function
+       | [] -> None
+       | bad ->
+            let names = bad |> List.map (fun c -> $"'{c.Label}'") |> String.concat ", "
+            Some
+                { ErrType =
+                    GenericSimError $"{names} can only be used on an array component"
+                  InDependency = None
+                  ConnectionsAffected = []
+                  ComponentsAffected = bad |> List.map (fun c -> c.Id) }
+
+/// Analyse a CanvasState and return any error (or None).
+let analyseState
+    (state: CanvasState)
+    (ldComps: LoadedComponent list)
+    : SimulationError option * ConnectionsWidth option
+    =
+    let widthErr, connectionsWidth = checkConnectionsWidths state
+    [ checkPortTypesAreConsistent state
+      checkPortsAreConnectedProperly state
+      checkIOLabels state
+      checkArrayIOIsOnAnArraySheet state
+      checkCustomComponentsOk state ldComps
+      widthErr
+      checkComponentNamesAreOk state
+      checkAdderUnnecessaryNC state ]
+    |> List.tryFind Option.isSome
+    |> Option.flatten,
+    connectionsWidth

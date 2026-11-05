@@ -1,0 +1,4 @@
+group Electron
+FSharp.Core
+Expecto
+Expecto.FsCheck

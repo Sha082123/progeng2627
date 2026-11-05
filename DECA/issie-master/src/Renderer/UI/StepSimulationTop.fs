@@ -1,0 +1,336 @@
+﻿module StepSimulationTop
+
+open Fulma
+open Fulma.Extensions.Wikiki
+open Fable.React
+open Fable.React.Props
+open Elmish
+
+open DiagramStyle
+open Notifications
+open PopupHelpers
+open ModelType
+open Sheet.SheetInterface
+open CommonTypes
+open SimGraphTypes
+open SimTypes
+open CanvasExtractor
+open Simulator
+open ModelHelpers
+open Optics
+open Optics.Optic
+open Optics.Operators
+open SimulationView
+
+let viewSimulation canvasState model dispatch =
+    /// This is the top-level function that creates a new fast simulation for the step simulator.
+    ///
+    /// The canvas is read here rather than taken from the render that asked for this. Every caller
+    /// goes through startSimulationWithSpinner, so the build happens a couple of frames after the
+    /// click, and one of them - saving the current input values as the defaults - rewrites the
+    /// symbols on the canvas first and needs the simulation built from what that left behind.
+    let startSimulation (model: Model) =
+        let canvasState = model.Sheet.GetCanvasState()
+        // make sure simulation runs with uptodate memory contents based on linked files.
+        // memory in model is not updated because the model update will be lost. This does
+        // matter because if memory contents are ever viewed the viewer will update them then.
+        let model = MemoryEditorView.updateAllMemoryComps model
+        // the simulation is about to use these contents, so say if a linked file did not load
+        MemoryEditorView.notifyMemoryFileErrors dispatch model
+        tryGetSimData false canvasState model
+        |> function
+            | Ok simData -> 
+                Ok simData
+            | Error simError ->
+                setSimErrorFeedback simError model dispatch
+                Error simError
+        |> StartSimulation
+        |> dispatch
+        match model.CurrentProj with
+        | Some project ->
+            // the whole list, not the open sheet filtered out of it: addStateToLoadedComponents
+            // replaces the named sheet itself, and what a canvas cannot say - parameters, top
+            // sheet, array settings - it carries forward from the copy already in the list
+            let ldcs = addStateToLoadedComponents simCache.Name canvasState project.LoadedComponents
+            simCache <- {simCache with StoredState = ldcs}
+        | None -> ()
+
+    let hasCanvasChanged
+        (currentCanvasState)
+        (simCache)
+        (model)
+        : bool = 
+        match model.CurrentProj with
+        | Some project ->
+            let ldcs = addStateToLoadedComponents simCache.Name currentCanvasState project.LoadedComponents
+            let isSame = storedstateisEqual simCache ldcs
+            not isSame
+        | _ -> false
+    
+    // Whether the design builds, and whether it is synchronous, are read from the model rather than
+    // worked out here: this function runs on every render, and working them out means flattening the
+    // whole hierarchy. See ModelType.CircuitCheck. A verdict that no longer matches the canvas is
+    // still shown - a button a moment out of date is better than an editor that stops - and asking
+    // for a new one is all this does about it.
+    if circuitCheckIsNeeded model canvasState then
+        dispatch RequestCircuitCheck
+
+    /// The last verdict on the design: Ok carrying whether it is synchronous. None before the
+    /// first check has run, which is the only time the tab does not know.
+    let verdict = model.CircuitCheck.Verdict |> Option.map fst
+
+    /// A design not yet checked reads as buildable. The button does the real build when pressed
+    /// and reports any error then, so an optimistic colour costs nothing but a wasted click.
+    let buildsOk = match verdict with Some(Error _) -> false | _ -> true
+
+    /// Whether a button is showing a spinner rather than its label, which it is between being
+    /// pressed and the simulation it asked for existing. Both the Start button and the Refresh
+    /// button ask for one, and only one of them is ever on screen.
+    let isLoading =
+        match model.RunAfterRenderWithSpinner with
+        | Some { ButtonSpinnerOn = true } -> true
+        | _ -> false
+
+    /// Build a simulation once the button that asked for it has been drawn asking.
+    ///
+    /// Not from the click handler: the build flattens the whole design and blocks for as long as
+    /// that takes, which on a large one is seconds with nothing on screen to say why. This puts the
+    /// spinner on the button, waits for the frame carrying it to be PAINTED, and only then builds -
+    /// see Update.runWhenPainted, and the waveform simulator's Start button, which does the same.
+    ///
+    /// `afterwards` runs on the model the build has just been made against, which is the current
+    /// one rather than the one this view was drawn from.
+    let startSimulationWithSpinner (afterwards: Model -> unit) =
+        dispatch <| RunAfterRender(true, fun _ model ->
+            startSimulation model
+            afterwards model
+            model)
+
+    match model.CurrentStepSimulationStep with
+    | None ->
+        let isSync = verdict = Some(Ok true)
+        let buttonColor, buttonText =
+            if buildsOk then
+                IsSuccess, "Start Simulation" + ModelHelpers.simulatorLabel model
+            else
+                IsWarning, "See Problems"
+        div [] [
+            str "Simulate simple logic using this tab."
+            br []
+            str (if isSync then "You can also use the Wave Simulation tab to view waveforms" else "")
+            br []; br []
+            Button.button
+                [
+                    Button.Color buttonColor
+                    Button.IsLoading isLoading
+                    Button.OnClick (fun _ -> startSimulationWithSpinner ignore)
+                ]
+                [ str buttonText ]
+        ]
+    | Some sim ->
+        let canvasStateChange = hasCanvasChanged canvasState simCache model
+        let body = match sim with
+                    | Error simError ->
+                        // The error report scrolls as one - it has no controls of its own to keep.
+                        div [Style [Flex "1 1 auto"; MinHeight "0px"; OverflowY OverflowOptions.Auto]]
+                            [viewSimulationError canvasState simError model StepSim dispatch]
+                    | Ok simData ->
+                        // The wire being FREE is part of the condition, not a detail of what to do
+                        // once it is met. A refresh is end, push, build, start - and with the .NET
+                        // simulator the build is an operation in flight, so the first render after
+                        // the click always finds one. Taking the remembered clock then spent it on
+                        // an advance that could only decline, and the panel came back at zero: the
+                        // restore worked in the renderer, where the build is synchronous and there
+                        // is nothing in flight to find. Left where it is, it is picked up by the
+                        // render that follows the build's own answer.
+                        if simData.ClockTickNumber = 0
+                           && simCache.ClockTickRefresh <> 0
+                           && not (ModelHelpers.sidecarIsBusy model) then
+                            // A Refresh puts the simulation back at the clock it was showing.
+                            // Through advanceTo, so it is the RUNNING simulator that is put there:
+                            // running the renderer's own would leave the .NET one at zero and the
+                            // panel reading a clock nothing had reached.
+                            let clock = simCache.ClockTickRefresh
+                            simCache <- {simCache with ClockTickRefresh = 0}
+                            // Where it GOT to: a refresh restores the clock the panel was showing,
+                            // and one chunk covers that unless the design is slow and the clock
+                            // large - in which case the panel shows what was reached and the next
+                            // refresh carries on, rather than claiming a cycle nothing ran to.
+                            advanceTo model simData clock dispatch (fun reached ->
+                                IncrementSimulationClockTick reached |> dispatch)
+                        viewSimulationData simData.ClockTickNumber simData model dispatch
+        let setDefaultButton =
+            match sim with
+            | Error _ -> div [] []
+            | Ok simData ->
+                Button.button
+                    [ 
+                        Button.Color IsInfo;
+                        Button.Disabled (InputDefaultsEqualInputs simData.FastSim model simData.ClockTickNumber)
+                        Button.OnClick (fun _ -> setInputDefaultsFromInputs model simData.FastSim dispatch simData.ClockTickNumber) ; 
+                        Button.Props [Style [Display DisplayOptions.Inline; Float FloatOptions.Right ]]
+                    ]
+                    [ str "Save current input values as default" ]
+
+        let confirmRefreshPopup (model:Model) dispatch (simData: SimulationData) =
+            fun (model:Model) ->
+                div [] 
+                    [
+                    div [Style [Height "60px"; Display DisplayOptions.Block; MarginBottom "5px"]] [
+                    h6 [Style [Width "80%"; Float FloatOptions.Left;]] [str $"Refresh the simulation using current values of the inputs and the latest design? 
+                    The current values will be used as default for future simulations."]
+                    Button.button [
+                        Button.Color IsSuccess
+                        Button.OnClick (fun _ ->
+                            // The defaults are dispatched onto the canvas and the build reads it
+                            // back, so they have to be asked for first and the build has to be the
+                            // deferred one. This used to raise a flag that the VIEW acted on, which
+                            // meant a whole simulation built during a render.
+                            let clock = simData.ClockTickNumber
+                            setInputDefaultsFromInputs model simData.FastSim dispatch clock
+                            ClosePopup |> dispatch
+                            startSimulationWithSpinner (fun _ ->
+                                simCache <- {simCache with ClockTickRefresh = clock})
+                        )
+                        Button.Props [Style [Display DisplayOptions.Inline; Float FloatOptions.Right; MarginTop "10px";]]
+                    ] [ str "Ok" ]]
+                    hr [Style [Width "100%"; Float FloatOptions.Left;]]
+                    div [Style [Height "50px"; Display DisplayOptions.Block;]] [
+                    h6 [Style [Width "80%"; Float FloatOptions.Left ]] [str $"Refresh the simulation using default values of inputs, current values will be lost."]
+                    Button.button [
+                        Button.Color IsInfo
+                        Button.OnClick (fun _ ->
+                            // The popup goes now and the build happens after the render that
+                            // removes it, so the spinner the caller asked for is on the Refresh
+                            // button underneath rather than on a button that is disappearing.
+                            let clock = simData.ClockTickNumber
+                            ClosePopup |> dispatch
+                            startSimulationWithSpinner (fun _ ->
+                                simCache <- {simCache with ClockTickRefresh = clock})
+                        )
+                        Button.Props [Style [Display DisplayOptions.Inline; Float FloatOptions.Right ]]
+                    ] [ str "Reset" ]]
+                ]
+
+        let buttonColor, buttonIcon =
+            if buildsOk then IsSuccess, refreshSvg "white" "20px" else IsWarning, str "See Problems"
+
+        let createRefreshButton buttonColor buttonIcon onClick =
+            Button.button [
+                Button.Color buttonColor;
+                Button.IsLoading isLoading
+                Button.OnClick onClick
+                Button.Props [Style [Display DisplayOptions.Inline; Float FloatOptions.None; MarginLeft "5px"]]
+            ] [buttonIcon]
+
+        /// Rebuild the simulation and put it back at the clock cycle it was showing.
+        let startSimulationUpdateCache clock =
+            startSimulationWithSpinner (fun _ ->
+                simCache <- { simCache with ClockTickRefresh = clock })
+
+        let createRefreshButtonForSimData sim model dispatch =
+            match sim with
+            | Ok (simData: SimulationData) ->
+                if InputDefaultsEqualInputsRefresh simData.FastSim model simData.ClockTickNumber then
+                    createRefreshButton buttonColor buttonIcon (fun _ ->
+                        let clock = simData.ClockTickNumber
+                        startSimulationUpdateCache clock)
+                else
+                    createRefreshButton buttonColor buttonIcon (fun _ ->
+                        if buildsOk then
+                            dialogPopupRefresh
+                                "Refresh"
+                                (confirmRefreshPopup model dispatch simData)
+                                []
+                                dispatch
+                        else
+                            startSimulationUpdateCache simData.ClockTickNumber)
+            | _ -> emptyRefreshSVG
+
+        let createRefreshButtonError =
+            createRefreshButton buttonColor buttonIcon (fun _ ->
+                let clock = simCache.ClockTickRefresh
+                startSimulationUpdateCache clock)
+
+        let refreshButton =
+            match canvasStateChange, sim with
+            | true, Ok _ -> createRefreshButtonForSimData sim model dispatch
+            | true, Error _ -> createRefreshButtonError
+            | _ -> emptyRefreshSVG
+    
+        // The pane is a flex column: what controls the simulation stays at the top whatever the
+        // design contains, and the signals below it scroll. A design with more inputs and viewers
+        // than fit would otherwise push End simulation, Refresh and the clock tick controls off
+        // the top of the pane, so that stepping the clock meant scrolling back up to reach them.
+        div [Style [Flex "1 1 auto"; MinHeight "0px"; Display DisplayOptions.Flex; FlexDirection "column"]] [
+            div [Style [Flex "0 0 auto"]] [
+                div [Style [Height "40px"]] [
+                Button.button
+                    [
+                        Button.Color IsDanger;
+                        Button.OnClick (fun _ ->
+                            simReset dispatch
+                            dispatch EndSimulation);
+                        Button.Props [Style [Display DisplayOptions.Inline; Float FloatOptions.Left;]]]
+                    [ str "End simulation" ]
+                refreshButton
+                setDefaultButton
+                ]
+                br [];
+                div [Style [Display DisplayOptions.Block;]] []
+                str "The simulation uses the diagram as it was at the moment of
+                     pressing the \"Start simulation\" or \"Refresh\" button using default input values."
+                hr []
+            ]
+            body
+        ]
+
+let tryStartSimulationAfterErrorFix (simType:SimSubTab) (model:Model) =
+    let withMsg msg model = model, Cmd.ofMsg msg
+    let withMsgs msgs model = model, Cmd.batch (msgs |> List.map Cmd.ofMsg)
+    let withCmdTTMsg ttMsg model = model, Cmd.ofMsg (TruthTableMsg ttMsg)
+    let conns = BusWire.extractConnections model.Sheet.Wire
+    let comps = SymbolUpdate.extractComponents model.Sheet.Wire.Symbol
+    let canvasState = comps,conns
+    let simErrFeedback simErr otherMsg =
+            (getSimErrFeedbackMessages simErr model) @ [otherMsg]
+
+    match simType with
+        | StepSim ->
+            tryGetSimData false canvasState model
+            |> function
+                | Ok (simData) -> 
+                    model
+                    |> set currentStepSimulationStep_ (simData |> Ok |> Some)
+                    |> withMsg (StartSimulation (Ok simData))
+                | Error simError ->
+                    model
+                    |> set currentStepSimulationStep_ (simError |> Error |> Some)
+                    |> withMsgs (simErrFeedback simError (StartSimulation (Error simError)))
+
+        | TruthTable ->
+            // a truth table reads its own local simulation whatever the simulator mode
+            simulateModel true false None 2 canvasState model
+            |> function
+                | Ok (simData), state ->
+                    if simData.IsSynchronous = false then
+                        model
+                        |> set currentStepSimulationStep_ (simData |> Ok |> Some)
+                        |> withCmdTTMsg (GenerateTruthTable (Some (Ok simData, state)))
+                    else
+                        { model with CurrentStepSimulationStep = None }
+                        |> withCmdTTMsg CloseTruthTable
+                | Error simError, state ->
+                    let feedbackMsg = GenerateTruthTable (Some (Error simError, state)) |> TruthTableMsg
+                    model
+                    |> set currentStepSimulationStep_ (simError |> Error |> Some)
+                    |> withMsgs (simErrFeedback simError feedbackMsg)
+
+        | WaveSim ->
+            // The unified start: stop whatever runs, rebuild, refresh - StartWaveSim's update
+            // branch, on the model as it then is. This branch used to duplicate that sequence,
+            // and its copy also recorded the wave build as a STEP simulation, which is how a
+            // fixed error could leave two simulations live at once.
+            model |> withMsg StartWaveSimulation
+
+

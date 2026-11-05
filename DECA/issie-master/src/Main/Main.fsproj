@@ -1,0 +1,35 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- ElectronAPI, Log and ContextMenus. They used to be <Compile Include="..\Renderer\...">
+         links, which had this project compiling files out of the renderer's tree and both
+         compilers writing the same generated file - see src/Shared/Shared.fsproj. Log also puts
+         both processes on one clock: it stamps process.uptime(), which is what stampStartup
+         prints. window.issieLog is a renderer thing and publish() is simply never called here. -->
+    <ProjectReference Include="..\Shared\Shared.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The `electron` module itself. Only this project: ElectronAPI.fs is shared for its types,
+         and importing the module from the renderer is what contextIsolation forbids. -->
+    <Compile Include="ElectronModule.fs" />
+    <!-- The half of the context menus that builds an Electron menu, here for the same reason -->
+    <Compile Include="ContextMenuBuilder.fs" />
+    <Compile Include="Bridge.fs" />
+    <Compile Include="Main.fs" />
+    <None Include="main.js" />
+  </ItemGroup>
+  <PropertyGroup>
+    <RepositoryUrl>https://github.com/tomcl/issie</RepositoryUrl>
+    <FsDocsReleaseNotesLink>https://github.com/tomcl/issie/releases/</FsDocsReleaseNotesLink>
+    <FsDocsLicenseLink>https://github.com/tomcl/issie/blob/master/LICENSE.md</FsDocsLicenseLink>
+    <FsDocsLogoSource>img/issie-chip.svg</FsDocsLogoSource>
+  </PropertyGroup>
+  <PropertyGroup>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

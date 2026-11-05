@@ -1,0 +1,682 @@
+(*
+    Simulator.fs
+
+    This module collects all the APIs required for a simulation. 
+*)
+
+module Simulator
+
+open CommonTypes
+open SimGraphTypes
+open SimTypes
+open FastBuild
+open SynchronousUtils
+open GraphBuilder
+open GraphMerger
+open SimulationGraphAnalyser
+open CanvasExtractor
+
+// Building a SimulationGraph has four phases (not precisely in order of execution):
+// 1. Building a simulation graph made of SimulationComponents.
+// 2. Merging all the necessary dependencies.
+// 3. Analyse the graph to look for errors, such as unconnected ports,
+//    combinatorial loops, etc...
+
+let cap (sheet: string) = sheet.ToUpper()
+
+/// look up a sheet in a set of loaded components
+let getSheet (ldcs: LoadedComponent list) (openSheet: string) =
+    match List.tryFind (fun ldc -> cap ldc.Name = cap openSheet) ldcs with
+    | None -> failwithf $"getSheet failed to look up '{openSheet}' in {ldcs |> List.map (fun ldc -> ldc.Name)}"
+    | Some name -> name
+
+/// look up a sheet in a set of loaded components, return [] or a list of the matching LoadedComponent
+let getLdcList (ldcs: LoadedComponent list) (openSheet: string) =
+    match List.tryFind (fun ldc -> cap ldc.Name = cap openSheet) ldcs with
+    | None -> failwithf $"getSheet failed to look up '{openSheet}' in {ldcs |> List.map (fun ldc -> ldc.Name)}"
+    | Some name -> name
+
+let getDirectDependencies (cs: CanvasState) =
+    fst cs
+    |> List.collect (fun comp ->
+        match comp.Type with
+        | Custom ct -> [ comp.Label, ct.Name ]
+        | _ -> [])
+
+let childrenOf (ldcs: LoadedComponent list) (sheet: string) =
+    getSheet ldcs sheet
+    |> (fun ldc -> getDirectDependencies ldc.CanvasState)
+
+/// Sheets needed to simulate sheet with name sheet.
+/// Sheets form a dependency tree.
+/// ldcs is a list of loaded components which must include sheet
+let rec sheetsNeeded (ldcs: LoadedComponent list) (sheet: string) : string list =
+    let children = childrenOf ldcs sheet |> List.map snd
+
+    children
+    |> List.map (sheetsNeeded ldcs)
+    |> List.concat
+    |> List.append children
+    |> List.append [ sheet ]
+    |> List.distinct
+
+/// canvasState: extracted canvasState from draw block.
+/// projLdcs: ldcs from project (current sheet ldc may be outofdate)
+/// diagramName: name of current open sheet.
+/// return updated list of all LDCs
+let getUpdatedLoadedComponentState diagramName canvasState projLdcs =
+    let ldcIsOpen ldc = ldc.Name = diagramName
+    // sheetFromCanvas and not extractLoadedSimulatorComponent: there IS a sheet behind this canvas
+    // - it is in projLdcs - and what its canvas cannot say has to come from there. Without it an
+    // array component being edited became an ordinary sheet with the wrong ports.
+    let ldc' =
+        projLdcs
+        |> List.tryFind ldcIsOpen
+        |> fun existing -> CanvasExtractor.sheetFromCanvas existing diagramName canvasState
+
+    let ldcs =
+
+        projLdcs
+        |> List.map (fun ldc -> if ldcIsOpen ldc then ldc' else ldc)
+        |> (fun ldcs ->
+            if not <| List.exists ldcIsOpen ldcs then
+                ldc' :: ldcs
+            else
+                ldcs)
+
+    ldcs
+
+/// gets the status of the simulation given current canvasState and project
+let getCurrentSimulationState
+    (canvState: CanvasState)
+    (project: Project option)
+    (fs: FastSimulation)
+    : SimulationRunStatus
+    =
+    match project with
+    | None -> SimNoProject
+    | _ when fs.SimulatedTopSheet = "" -> SimEmpty
+    | Some p ->
+        // DesignAsDrawn, not the simulated sheets: an expanded array component is a wrapper and a
+        // body, and the project holds neither of them. See SimulatedDesign.DesignAsDrawn.
+        let simIsUpToDate =
+            fs.Design.DesignAsDrawn
+            |> List.forall (fun ldc ->
+                match
+                    p.OpenFileName = ldc.Name,
+                    List.tryFind (fun (ldc': LoadedComponent) -> ldc'.Name = ldc.Name) p.LoadedComponents
+                with
+                | _, None -> false
+                | false, Some ldc' -> CanvasExtractor.loadedComponentIsEqual ldc ldc'
+                | true, Some _ -> CanvasExtractor.stateIsEqual ldc.CanvasState canvState)
+
+        match simIsUpToDate, p.OpenFileName = fs.SimulatedTopSheet with
+        | false, _ -> SimOutOfDate
+        | true, true -> SimValidSameSheet
+        | true, false -> SimValidDifferentSheet
+
+/// Helper used convert port into SheetPort for use by wave simulator determining connectivity
+/// within a design sheet.
+/// name is the name of the containing sheet.
+let portSheetPort (compsWithIds: Map<ComponentId, Component>) (name: string) port =
+    let comp = compsWithIds[port.HostId]
+    let compPort = comp.getPort port.Id
+
+    match compPort with
+    | None -> None
+    | Some cPort -> { PortOnComp = cPort; Sheet = name } |> Some
+
+/// canvasState: extracted canvasState from draw block.
+/// loadedComponents: from project
+/// diagramName: name of current open sheet.
+/// save all needed by simulation ldcs in the FastSimulation record.
+/// The top sheet name must be saved separately - since if a simulation is being refreshed it must not change
+let saveStateInSimulation
+    (canvasState: CanvasState)
+    (openFileName: string)
+    (loadedComponents: LoadedComponent list)
+    // The same design as the PROJECT holds it, before any array component was expanded - the only
+    // form in which "has this been edited since?" can be asked. See SimulatedDesign.DesignAsDrawn.
+    // Plain comments, not `///`: an XML doc comment is not allowed on a parameter, and one written
+    // there is an FS3520 on every compile.
+    ((drawnCanvasState, drawnComponents): CanvasState * LoadedComponent list)
+    // The port labels each array copy is SHOWN with - see ArrayElaborate.CopyPortNames.
+    (copyNames: ArrayElaborate.CopyPortNames)
+    (fs: FastSimulation)
+    =
+    let diagramName = openFileName
+    let ldcs = getUpdatedLoadedComponentState diagramName canvasState loadedComponents
+    let asDrawn =
+        let drawn = getUpdatedLoadedComponentState diagramName drawnCanvasState drawnComponents
+        sheetsNeeded drawn diagramName |> List.map (getSheet drawn)
+    sheetsNeeded ldcs diagramName
+    |> List.map (getSheet ldcs)
+    |> (fun updatedLdcs ->
+
+        let compMap, portMap =
+            updatedLdcs
+            |> List.map (fun ldc ->
+                let comps, conns = ldc.CanvasState
+
+                // The DESIGN's copy of each component, which is what the waveform selector names
+                // ports from - so an array copy is shown with the channel numbers of the copy it
+                // is, rather than with copy 0's. Applied here and not to the canvas: the canvas is
+                // what the simulation is built from, and a Custom component's port labels are what
+                // wire it to its sheet. See ArrayElaborate.CopyPortNames.
+                let shown (comp: Component) =
+                    match comp.Type, Map.tryFind comp.Id copyNames with
+                    | Custom ct, Some (ins, outs) ->
+                        { comp with Type = Custom { ct with InputLabels = ins; OutputLabels = outs } }
+                    | _ -> comp
+
+                let compsWithIds =
+                    comps
+                    |> List.map (fun comp -> comp.Id, shown comp)
+                    |> Map.ofList
+
+                let portSheetPort = portSheetPort compsWithIds ldc.Name
+
+                let addConnToPort (portOpt: SheetPort option) conn pMap : Map<SheetPort, Connection list> =
+                    match portOpt with
+                    | None -> pMap
+                    | Some port ->
+                        pMap
+                        |> Map.change port (function
+                            | Some conns -> Some(conn :: conns)
+                            | None -> Some [ conn ])
+
+                let portsToConnections =
+                    (Map.empty, conns)
+                    ||> List.fold (fun pMap conn ->
+                        pMap
+                        |> addConnToPort (portSheetPort conn.Source) conn
+                        |> addConnToPort (portSheetPort conn.Target) conn)
+                    |> Map.toList
+
+                ((ldc.Name, compsWithIds), portsToConnections))
+            |> List.unzip
+
+        let compMap = compMap |> Map.ofList
+        let portMap = portMap |> List.concat |> Map.ofList
+
+        { fs with
+            Design =
+                { fs.Design with
+                    DesignSheets = updatedLdcs
+                    DesignAsDrawn = asDrawn
+                    DesignComponentsById = compMap
+                    DesignConnectionsByPort = portMap } })
+
+/// The design to send to the .NET sidecar: THE sheets this simulation was built from.
+///
+/// **Built from the simulation and not from the project, and that is the point.** The renderer has
+/// already turned the project into the circuit it simulates - array components expanded into a
+/// wrapper and a body - and this hands the sidecar that, so the two processes simulate the same
+/// sheets rather than each deriving them from the same input and hoping to agree.
+///
+/// They had to agree exactly, because SimSetInputs names a component by ID across the wire and
+/// expansion MINTS ids for everything it makes. Two expansions agreeing was luck: the same code
+/// over the same list in the same order. Nothing enforced it and nothing tested it. Now only one
+/// of the two ever expands, so there is nothing to agree about.
+///
+/// It is also why the wire format knows nothing about array components, and must not learn: a
+/// SimpleSheet that crossed this boundary is an ordinary sheet by construction.
+let designForSidecar (fs: FastSimulation) : SimpleDesign =
+    CanvasExtractor.simpleDesignOfLoadedComponents fs.Design.DesignSheets
+    |> fun d -> { d with TopSheet = fs.SimulatedTopSheet }
+
+/// The design as the simulator must see it: every ARRAY DESIGN SHEET replaced by the two ordinary
+/// sheets it expands to - a wrapper holding n instances of a body sheet, wired up, with the glue
+/// that makes the array's own ports. See ArrayElaborate.
+///
+/// Done here, once, before anything else looks at the design, and that is the whole of the array
+/// feature as far as the simulator is concerned: after this no canvas holds a BusOut, an MuxOut
+/// or a join, so the dependency machinery, the parameter resolution, the budget check, the flatten
+/// and the waveform selector all do their ordinary work on ordinary sheets. It can be a plain
+/// rewrite because the number of copies is a fixed integer on the sheet rather than a parameter
+/// expression, so it is a fact about the sheet and not about who instantiated it.
+///
+/// The top sheet is expanded too, when it is an array sheet: what is simulated then is the array
+/// itself, at whatever its own properties say, which is the honest meaning of simulating it.
+///
+/// **`loadedDependencies` is the WHOLE design, the sheet named `diagramName` included**, wherever
+/// there is a sheet behind that canvas. What a sheet IS - whether it is an array component - lives
+/// on the sheet and not on its canvas, so a caller that filters the top sheet out hides its array
+/// settings from this: the top is then left unexpanded and its own IO is refused by
+/// CanvasStateAnalyser as being on a sheet that is not an array component, which is what the
+/// Simulation tab's verdict used to say about an array component the user had open. The one caller
+/// with no sheet behind its canvas is the truth table's selection, which builds a canvas of its
+/// own; there `topSheet` is None and there are genuinely no settings to read.
+let private expandArrayDesign
+        (diagramName: string)
+        (canvasState: CanvasState)
+        (loadedDependencies: LoadedComponent list)
+        : Result<CanvasState * LoadedComponent list * ArrayElaborate.CopyPortNames, SimulationError> =
+    match loadedDependencies |> List.exists (fun ldc -> ldc.ArrayInfo.IsSome) with
+    // by far the common case: nothing to do, and nothing allocated to find that out
+    | false -> Ok (canvasState, loadedDependencies, Map.empty)
+    | true ->
+        let topSheet = loadedDependencies |> List.tryFind (fun ldc -> ldc.Name = diagramName)
+        let expanded, problems, copyNames = ArrayElaborate.expandArraySheets loadedDependencies
+
+        /// The sheets this design actually uses, by name.
+        ///
+        /// A broken array sheet somewhere else in the project must not stop a design that does not
+        /// instantiate it - which is the rule checkDependenciesAndBuildMap already follows for
+        /// every other kind of error in a sheet. Walked over the sheets as they were BEFORE
+        /// expansion, since that is what the problems are named after; a sheet that is missing is
+        /// no error here, and is reported as DependencyNotFound where that is what it means.
+        let rec reach (seen: Set<string>) (comps: Component list) =
+            comps
+            |> List.choose (fun comp -> match comp.Type with | Custom cc -> Some cc.Name | _ -> None)
+            |> List.fold (fun seen name ->
+                match Set.contains name seen with
+                | true -> seen
+                | false ->
+                    loadedDependencies
+                    |> List.tryFind (fun ldc -> ldc.Name = name)
+                    |> function
+                       | None -> Set.add name seen
+                       | Some ldc -> reach (Set.add name seen) (fst ldc.CanvasState)) seen
+
+        let used = reach (Set.singleton diagramName) (fst canvasState)
+
+        match problems |> List.filter (fun (sheet, _) -> Set.contains sheet used) with
+        // The FIRST problem only. One mistake on an array sheet can be several problems - a channel
+        // driven twice is also a port name derived twice - and a list of them reads as a list of
+        // faults to fix rather than the one there is. ArrayExpand puts the message that names the
+        // fault itself before any consequence of it.
+        | (_, problem) :: _ ->
+            Error
+                { ErrType = GenericSimError problem.Message
+                  InDependency = None
+                  // what the simulator highlights in red on the sheet, so the message is read
+                  // beside the components it is about
+                  ComponentsAffected = problem.Components
+                  ConnectionsAffected = [] }
+        | [] ->
+            // Where the top sheet is an array component, what is simulated is its wrapper.
+            //
+            // Decided from the top SHEET's own array settings rather than by looking its name up
+            // in the expansion, so that "the top is not an array component" and "the top is not a
+            // sheet of this design at all" are told apart. Both used to arrive here as a missing
+            // entry and both fell through to the canvas passed in - which is right for the first
+            // and silently wrong for the second, and the second is the state a caller that filters
+            // the top sheet out leaves behind.
+            let topCanvas =
+                match topSheet |> Option.bind (fun ldc -> ldc.ArrayInfo) with
+                | None -> canvasState
+                | Some _ ->
+                    expanded
+                    |> List.tryFind (fun ldc -> ldc.Name = diagramName)
+                    |> Option.map (fun ldc -> ldc.CanvasState)
+                    |> Option.defaultValue canvasState
+            Ok (topCanvas, expanded, copyNames)
+
+/// Extract circuit data from inputs and return a valid SimulationGraph or an error
+let validateCircuitSimulation
+    (diagramName: string)
+    (canvasState: CanvasState)
+    (loadedDependencies: LoadedComponent list)
+    : Result<SimulationGraph, SimulationError>
+    =
+    // HERE rather than only at the entry points that build a simulation, because this is what
+    // everything asking "does this design work" goes through - the Simulation tab's verdict and the
+    // wave viewer's price among them - and an entry point that forgot expansion reported an array
+    // component as a sheet with array components illegally on it. Idempotent: expansion leaves no
+    // sheet with ArrayInfo, so the caller that has already expanded pays one List.exists.
+    match expandArrayDesign diagramName canvasState loadedDependencies with
+    | Error e -> Error e
+    | Ok (canvasState, loadedDependencies, copyNames) ->
+
+    // Tune for performance of initial zero-length simulation versus longer run.
+    // Probably this is not critical.
+    match runCanvasStateChecksAndBuildGraph canvasState loadedDependencies with
+    | Error err -> Error err
+    | Ok graph ->
+        match mergeDependencies diagramName graph canvasState loadedDependencies with
+        | Error err -> Error err
+        | Ok graph ->
+            // Simulation graph is fully merged with dependencies.
+            // Perform checks on it
+            let components, connections = canvasState
+            match analyseSimulationGraph diagramName graph connections with
+            | Some err -> Error err
+            | None -> Ok graph
+
+
+/// Extract circuit data from inputs and return a checked SimulationData object or an error
+/// SimulationData has some technical debt, it wraps FastSimulation adding some redundant data
+///
+/// `waveTables` says whether to build what only a wave viewer reads - see WaveTables.
+let startCircuitSimulationWith
+    (waveTables: WaveTables)
+    (simulationArraySize: int)
+    (diagramName: string)
+    (canvasState: CanvasState)
+    (loadedDependencies: LoadedComponent list)
+    : Result<SimulationData, SimulationError>
+    =
+
+    SimLog.beginInvocation ()
+    let buildStart = TimeHelpers.getTimeMs ()
+
+    let asDrawn = canvasState, loadedDependencies
+    match expandArrayDesign diagramName canvasState loadedDependencies with
+    | Error e -> Error e
+    | Ok (canvasState, loadedDependencies, copyNames) ->
+
+    match validateCircuitSimulation diagramName canvasState loadedDependencies with
+    | Error e -> Error e
+    | Ok graph ->
+        try
+            match FastBuild.buildFastSimulationWith waveTables simulationArraySize diagramName graph with
+            | Ok fs ->
+                let fs = saveStateInSimulation canvasState diagramName loadedDependencies asDrawn copyNames fs
+                let components, _ = canvasState
+                let inputs, outputs = getSimulationIOs components
+
+                // one record per build, in both runtimes - see SimLog
+                SimLog.record
+                    SimLog.SimBuild
+                    diagramName
+                    fs.FCompsByIndex.Length
+                    0
+                    0
+                    (TimeHelpers.getTimeMs () - buildStart)
+
+                Ok
+                    {   FastSim = fs
+                        Graph = graph // NB graph is now not initialised with data
+                        Inputs = inputs
+                        Outputs = outputs
+                        IsSynchronous = hasSynchronousComponents graph
+                        NumberBase = Hex
+                        ClockTickNumber = 0 }
+            | Error e -> Error e
+        with e ->
+            Log.error $"exception during simulation: {e.Message}\n{e.StackTrace}"
+
+            Error
+                {   ErrType = InternalError e
+                    InDependency = None
+                    ComponentsAffected = []
+                    ConnectionsAffected = [] }
+        |> Result.map (fun sd ->
+            //Fast.compareFastWithGraph sd |> ignore
+            sd)
+
+/// A simulation with everything a wave viewer in this process needs, which is what almost every
+/// caller wants. The sidecar is the exception and asks for NoWaveTables.
+let startCircuitSimulation
+    (simulationArraySize: int)
+    (diagramName: string)
+    (canvasState: CanvasState)
+    (loadedDependencies: LoadedComponent list)
+    : Result<SimulationData, SimulationError>
+    =
+    startCircuitSimulationWith WithWaveTables simulationArraySize diagramName canvasState loadedDependencies
+
+let startCircuitSimulationFData
+    (simulationArraySize: int)
+    (diagramName: string)
+    (canvasState: CanvasState)
+    (loadedDependencies: LoadedComponent list)
+    : Result<SimulationData, SimulationError>
+    =
+
+    let asDrawn = canvasState, loadedDependencies
+    match expandArrayDesign diagramName canvasState loadedDependencies with
+    | Error e -> Error e
+    | Ok (canvasState, loadedDependencies, copyNames) ->
+
+    // Tune for performance of initial zero-length simulation versus longer run.
+    // Probably this is not critical.
+    match runCanvasStateChecksAndBuildGraph canvasState loadedDependencies with
+    | Error err -> Error err
+    | Ok graph ->
+        match mergeDependencies diagramName graph canvasState loadedDependencies with
+        | Error err -> Error err
+        | Ok graph ->
+            // Simulation graph is fully merged with dependencies.
+            // Perform checks on it
+            let components, connections = canvasState
+            let inputs, outputs = getSimulationIOs components
+            match analyseSimulationGraph diagramName graph connections with
+            | Some err -> Error err
+            | None ->
+                try
+                    match FastBuild.buildFastSimulationFData simulationArraySize diagramName graph with
+                    | Ok fs ->
+                        let fs = saveStateInSimulation canvasState diagramName loadedDependencies asDrawn copyNames fs
+
+                        Ok
+                            { FastSim = fs
+                              Graph = graph // NB graph is now not initialised with data
+                              Inputs = inputs
+                              Outputs = outputs
+                              IsSynchronous = hasSynchronousComponents graph
+                              NumberBase = Hex
+                              ClockTickNumber = 0 }
+                    | Error e -> Error e
+                with
+                | AlgebraNotImplemented e -> Error e
+                | e ->
+                    Log.error $"exception during simulation: {e.Message}\n{e.StackTrace}"
+
+                    Error
+                        { ErrType = InternalError e
+                          InDependency = None
+                          ComponentsAffected = []
+                          ConnectionsAffected = [] }
+                |> Result.map (fun sd ->
+                    //Fast.compareFastWithGraph sd |> ignore
+                    sd)
+
+
+type SimCache = {
+    Name: string
+    ClockTickRefresh: int
+    StoredState: LoadedComponent list
+    StoredResult: Result<SimulationData, SimulationError>
+    /// quick access link to Fast Simulation, or placeholder if one does not exist
+    FastSim: FastSimulation
+    }
+
+
+        
+
+
+
+let simCacheInit () = {
+    Name = ""; 
+    ClockTickRefresh = 0
+    FastSim = FastCreate.simulationPlaceholder
+    StoredState = []
+    StoredResult = Ok {
+        FastSim = 
+            FastCreate.simulationPlaceholder
+        Graph = Map.empty 
+        Inputs = []
+        Outputs = []
+        IsSynchronous=false
+        NumberBase = NumberBase.Hex
+        ClockTickNumber = 0
+        }
+    }
+        
+/// THE simulation, memoised against the design it was built from - the single-entry memo that
+/// makes "the simulation is a memoised version of the simulation spec" literally true.
+///
+/// ONE slot, because Issie runs one simulation at a time: the step and waveform simulators are
+/// mutually exclusive, one must be stopped before the other starts, and the only difference
+/// between their builds is the array-size parameter - the step simulator wraps a small circular
+/// buffer, the waveform simulator sizes the same buffer to hold the whole run so it never wraps.
+/// There used to be a slot for each, justified by nothing: the memo can never be warm across a
+/// switch, since the array size differs and forces the rebuild anyway. What the second slot did
+/// do is let a stopped simulation linger unreleased while the other kind ran - the retention
+/// problem the refs harness command exists to chase - and starting either kind now evicts
+/// whatever was here by replacing it.
+let mutable simCache: SimCache = simCacheInit ()
+
+/// The currently active FastSimulation - a dummy if none has been built. Callers on wave-sim
+/// paths must be guarded by the MODEL saying a wave simulation is live (WaveSimSheet, ws.State):
+/// under mutual exclusion the slot then holds that simulation and nothing else can.
+let getFastSim() = simCache.FastSim
+
+let cacheIsEqual (cache: SimCache) (ldcs: LoadedComponent list ) : bool=
+    match cache.StoredResult with
+    | Error _ -> false
+    | Ok {FastSim =fs} -> 
+        fs.SimulatedCanvasState
+        |> List.forall (fun ldc' ->
+            ldcs
+            |> List.tryFind (fun ldc'' -> ldc''.Name = ldc'.Name)
+            |> Option.map (loadedComponentIsEqual ldc')
+            |> (=) (Some true))
+
+let storedstateisEqual (cache: SimCache) (ldcs: LoadedComponent list) : bool =
+    match cache.StoredState with
+    | [] -> false
+    | ldcsstate -> 
+        ldcsstate
+        |> List.forall (fun ldc' ->
+            ldcs
+            |> List.tryFind (fun ldc'' -> ldc''.Name = ldc'.Name)
+            |> Option.map (loadedComponentIsEqualExInputDefault ldc')
+            |> (=) (Some true))
+            
+let makeDummySimulationError msg = {
+        ErrType = GenericSimError msg
+        InDependency = None
+        ConnectionsAffected = []
+        ComponentsAffected = []
+    }
+
+/// Does one sheet of a design build into a simulation? The question behind the Simulation tab's
+/// verdict button and the wave viewer's price, and the cheapest way to ask it: the graph is checked
+/// and thrown away, with no step arrays allocated.
+///
+/// **THE one place that says how a design is checked**, and it is written down because it was
+/// written twice and the two drifted. The whole design goes to validateCircuitSimulation - the
+/// named sheet included - while getStateAndDependencies is asked only for that sheet's canvas: it
+/// removes the sheet from the list it returns, and what a sheet IS rather than what is drawn on it
+/// (its parameters, and whether it is an ARRAY COMPONENT whose hardware is several copies of what
+/// is drawn on it) is on the sheet and not on the canvas. Passing the shortened list on left
+/// nothing able to say the sheet being checked was an array component, so the checks ran on its
+/// unexpanded canvas and refused its own IO as being on a sheet that is not an array component.
+///
+/// `ldcs` is the design as the model holds it now - ModelHelpers.designOf, which puts the canvas
+/// being drawn in place of the open sheet's saved copy.
+let validateSheetOfDesign (sheetName: string) (ldcs: LoadedComponent list) : Result<SimulationGraph, SimulationError> =
+    CanvasExtractor.getStateAndDependencies sheetName ldcs
+    |> Result.mapError makeDummySimulationError
+    |> Result.bind (fun (_, state, _) -> validateCircuitSimulation sheetName state ldcs)
+
+/// A simulation carrier with no simulation in it: what the renderer holds when the .NET sidecar
+/// is the one simulating.
+///
+/// It carries the DESIGN - which answers every structure question the UI asks - the top sheet's
+/// IOs, whether the circuit is clocked, and the checked graph, exactly as a real build would. What
+/// it does not hold is the expansion: no components, no step arrays, no drivers. Widths and data
+/// come from the sidecar - widths through the port slices, data through the reads - and the local
+/// fields every gate consults say so: NumStepArrays 0, empty maps.
+///
+/// The design is still validated here, by the same checks a build runs, so a design that cannot
+/// simulate is refused synchronously with the same error the user has always seen - components
+/// highlighted and all. What is skipped is everything after validation: the flatten, the arrays,
+/// the ordering.
+let designOnlySimulation
+    (simulationArraySize: int)
+    (diagramName: string)
+    (canvasState: CanvasState)
+    (loadedDependencies: LoadedComponent list)
+    : Result<SimulationData, SimulationError> =
+    let asDrawn = canvasState, loadedDependencies
+    match expandArrayDesign diagramName canvasState loadedDependencies with
+    | Error e -> Error e
+    | Ok (canvasState, loadedDependencies, copyNames) ->
+
+    match validateCircuitSimulation diagramName canvasState loadedDependencies with
+    | Error e -> Error e
+    | Ok graph ->
+        let fs =
+            { FastCreate.emptyFastSimulation diagramName with MaxArraySize = simulationArraySize }
+            |> saveStateInSimulation canvasState diagramName loadedDependencies asDrawn copyNames
+
+        let components, _ = canvasState
+        let inputs, outputs = getSimulationIOs components
+
+        Ok
+            { FastSim = fs
+              Graph = graph
+              Inputs = inputs
+              Outputs = outputs
+              IsSynchronous = hasSynchronousComponents graph
+              NumberBase = Hex
+              ClockTickNumber = 0 }
+
+/// Start up a simulation, doing all necessary checks and generating simulation errors
+/// if necesary. The code to do this is quite long so results are memoized. 
+///
+/// `localBuild` false builds the design-only carrier above instead of a real simulation - what
+/// the renderer wants when the sidecar simulates. Truth tables always pass true: they read their
+/// own local simulation whatever mode the simulators are in.
+let prepareSimulationMemoized
+        (localBuild: bool)
+        (isWaveSim: bool)
+        (simulationArraySize: int)
+        (openFileName: string)
+        (diagramName : string)
+        (canvasState : CanvasState)
+        (loadedDependencies : LoadedComponent list)
+        : Result<SimulationData, SimulationError> * CanvasState =
+    // One body for both simulators: isWaveSim flavours the log line and nothing else, because
+    // the only real difference between the two builds is simulationArraySize - which is compared
+    // below, so switching simulators always misses the memo and rebuilds.
+    let storedArraySize = simCache.FastSim.MaxArraySize
+
+    // A carrier and a real build of the same design must not answer for each other, and which the
+    // slot holds is written in it: a real build has step arrays, a carrier has none.
+    let storedIsLocal = simCache.FastSim.NumStepArrays > 0
+
+    let ldcs = addStateToLoadedComponents openFileName canvasState loadedDependencies
+    let isSame =
+            storedArraySize = simulationArraySize &&
+            localBuild = storedIsLocal &&
+            diagramName = simCache.Name &&
+            cacheIsEqual simCache ldcs
+    if isSame then
+        simCache.StoredResult, canvasState
+    else
+        let kind =
+            (if isWaveSim then "waveform simulation" else "simulation")
+            + (if localBuild then "" else " (design-only: the .NET sidecar simulates)")
+
+        Log.dbg Log.Sim $"new {kind} of {simulationArraySize} clocks"
+        simCache <- {simCache with StoredResult = Error <| makeDummySimulationError "Simulation deleted"; FastSim = FastCreate.simulationPlaceholder}
+        let simResult =
+            getStateAndDependencies diagramName ldcs
+            |> Result.mapError makeDummySimulationError
+            |> Result.bind (fun (_, state, _) ->
+                // The whole design, the top sheet included, rather than the dependencies alone.
+                // The simulator needs the top sheet's own settings - whether it is an array design
+                // sheet, which decides what its hardware is - and those live on the sheet, which
+                // getStateAndDependencies drops. Harmless: checkDependenciesAndBuildMap keeps only
+                // the sheets the top reaches, and the top is not among them unless something
+                // instantiates it, which is a cycle and is caught as one.
+                let design =
+                    ldcs
+                    |> List.map (fun ldc ->
+                        if ldc.Name = diagramName then { ldc with CanvasState = state } else ldc)
+                if localBuild then
+                    startCircuitSimulation simulationArraySize diagramName state design
+                else
+                    designOnlySimulation simulationArraySize diagramName state design)
+        let fastSim =
+            simResult
+            |> Result.map (fun sd -> sd.FastSim)
+            |> Result.defaultValue FastCreate.simulationPlaceholder
+        simCache <- {simCache with Name = diagramName; StoredResult = simResult; FastSim = fastSim}
+        simResult, canvasState
+        

@@ -1,0 +1,11 @@
+group Electron
+    Fable.Core
+    Fable.Browser.Dom
+    Fable.Elmish
+    Fable.Elmish.React
+    Fable.Elmish.Debugger
+    Fable.Elmish.HMR
+    Fable.Node
+    Fable.Promise
+    Fable.React
+    Fulma

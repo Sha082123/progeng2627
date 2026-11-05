@@ -1,0 +1,64 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="PathHelperTests.fs" />
+    <Compile Include="RecentProjects.fs" />
+    <Compile Include="TestFixtures.fs" />
+    <Compile Include="CanvasBuilder.fs" />
+    <Compile Include="LookupArrayTests.fs" />
+    <Compile Include="ListPairsTests.fs" />
+    <Compile Include="WidthInference.fs" />
+    <Compile Include="GoldenModel.fs" />
+    <Compile Include="ComponentSemantics.fs" />
+    <Compile Include="Properties.fs" />
+    <Compile Include="ParameterScenarios.fs" />
+    <Compile Include="ArraySheets.fs" />
+    <Compile Include="AlgebraTests.fs" />
+    <Compile Include="NumberHelpersTests.fs" />
+    <Compile Include="TruthTableSimTests.fs" />
+    <Compile Include="PersistenceTests.fs" />
+    <Compile Include="SimpleDesignTests.fs" />
+    <Compile Include="SheetDescriptionTests.fs" />
+    <Compile Include="DrawBlockTests.fs" />
+    <Compile Include="WireQuality.fs" />
+    <Compile Include="PasteArrayGeometry.fs" />
+    <Compile Include="MarkdownTests.fs" />
+    <Compile Include="LibraryTests.fs" />
+    <Compile Include="SheetHierarchy.fs" />
+    <Compile Include="ReadOnlySheetTests.fs" />
+    <Compile Include="ParameterUI.fs" />
+    <Compile Include="MemoryParameters.fs" />
+    <Compile Include="ComponentSlotTests.fs" />
+    <Compile Include="InstanceSignatures.fs" />
+    <Compile Include="WaveSelection.fs" />
+    <Compile Include="CustomOutputExtraction.fs" />
+    <Compile Include="SimulationBudget.fs" />
+    <Compile Include="StaleSheetName.fs" />
+    <Compile Include="RomComments.fs" />
+    <Compile Include="RamStoreTests.fs" />
+    <Compile Include="RamBenchmark.fs" />
+    <Compile Include="SimBenchmark.fs" />
+    <Compile Include="KeyBindingTests.fs" />
+    <Compile Include="VerilogOutput.fs" />
+    <Compile Include="VerilogCompiler.fs" />
+    <Compile Include="ExceptionBuffer.fs" />
+    <Compile Include="SourceHygiene.fs" />
+    <Compile Include="CarrierTests.fs" />
+    <Compile Include="SheetIdentity.fs" />
+    <Compile Include="Main.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Renderer\Renderer.fsproj" />
+    <ProjectReference Include="..\..\src\Sidecar\Issie.Sidecar.fsproj" />
+  </ItemGroup>
+
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

@@ -1,0 +1,434 @@
+﻿/// Refusing a simulation that will not fit in memory, before any of it is allocated.
+///
+/// There are two ways a design exhausts memory and both are refused here. Its step arrays may be
+/// too large, which is a question of how many cycles are asked for; or the design itself may expand
+/// too far, since every sheet is copied into every place it is used and that multiplies down the
+/// hierarchy. The second is the one that turns a small-looking project into millions of components.
+///
+/// The point of both checks is that they happen BEFORE the memory is taken: either used to allocate
+/// until the machine gave out. So the tests here ask for absurd sizes and expect an ordinary
+/// SimulationError back, promptly, rather than a crash or a wait - and a test that finishes at all
+/// is a good part of what is being asserted.
+///
+/// The two step-array budgets are separate because the two memories are: buses of 32 bits and under
+/// are held in Uint32Arrays outside the V8 heap, wider ones as arrays of BigInt inside it. A design
+/// of wide buses can be refused while the same design in narrow buses is allowed, and the split
+/// asserted below is what keeps that true.
+module SimulationBudget
+
+open Expecto
+open CommonTypes
+open SimTypes
+open SimGraphTypes
+open CanvasBuilder
+
+/// A + B -> S, all three at the given bus width. Combinational, so nothing here allocates the
+/// per-step state array and the heap cost is the bigint arrays alone.
+let private adderSheet (name: string) (w: int) =
+    let a = makeComp 1 0 1 (Input1(w, None)) "A"
+    let b = makeComp 2 0 1 (Input1(w, None)) "B"
+    let add = makeComp 3 2 1 (NbitsAdderNoCinCout w) "ADD"
+    let s = makeComp 4 1 0 (Output w) "S"
+    makeLdc name None ([ a; b; add; s ], [ conn a 0 add 0; conn b 0 add 1; conn add 0 s 0 ])
+
+let private simulate (cycles: int) (ldc: LoadedComponent) =
+    Simulator.startCircuitSimulation cycles ldc.Name ldc.CanvasState [ ldc ]
+
+/// IN -> NOT -> OUT. Three components, and the bottom of every hierarchy below.
+let private leaf =
+    let i = makeComp 1 0 1 (Input1(1, None)) "IN"
+    let n = makeComp 2 1 1 Not "N"
+    let o = makeComp 3 1 0 (Output 1) "OUT"
+    makeLdc "leaf" None ([ i; n; o ], [ conn i 0 n 0; conn n 0 o 0 ])
+
+/// A sheet holding `copies` instances of `child` in a chain from IN to OUT, so that every instance
+/// is properly driven and the sheet passes the checks that run before the size is looked at.
+let private chainSheet (name: string) (child: LoadedComponent) (copies: int) =
+    let inp = makeComp 1 0 1 (Input1(1, None)) "IN"
+    let out = makeComp 2 1 0 (Output 1) "OUT"
+    let instances =
+        [ for i in 1..copies ->
+            makeComp (2 + i) 1 1 (customOf child [ "IN", 1 ] [ "OUT", 1 ] None) $"C{i}" ]
+    let chain = (inp :: instances) @ [ out ]
+    let conns = chain |> List.pairwise |> List.map (fun (a, b) -> conn a 0 b 0)
+    makeLdc name None (chain, conns)
+
+/// `levels` sheets stacked on the leaf, each instantiating the one below it `copies` times.
+/// Small on disk however deep it goes - which is the whole point.
+let private hierarchy (levels: int) (copies: int) : LoadedComponent * LoadedComponent list =
+    ((leaf, [ leaf ]), [ 1..levels ])
+    ||> List.fold (fun (child, all) k ->
+        let sheet = chainSheet $"lvl{k}" child copies
+        sheet, sheet :: all)
+
+let private expandedCount (levels: int) (copies: int) =
+    let top, sheets = hierarchy levels copies
+    GraphMerger.expandedComponentCount top.Name top.CanvasState sheets
+
+let private costOf (w: int) =
+    match simulate 10 (adderSheet "budget" w) with
+    | Ok simData -> simData.FastSim.StepCost
+    | Error e -> failtest $"Simulation failed: %A{e}"
+
+let tests =
+    testList "SimulationBudget" [
+        test "a design of narrow buses costs typed array memory and no heap" {
+            let cost = costOf 8
+            Expect.isGreaterThan cost.TypedArrayBytes 0 "8-bit buses are held in Uint32Arrays"
+            Expect.equal cost.HeapBytes 0
+                "nothing here is wider than 32 bits or clocked, so nothing is held in the heap"
+        }
+
+        test "a design of wide buses costs heap memory and no typed array memory" {
+            let cost = costOf 64
+            Expect.equal cost.TypedArrayBytes 0 "64-bit buses are not held in Uint32Arrays"
+            Expect.isGreaterThan cost.HeapBytes 0 "they are held as arrays of BigInt, in the heap"
+        }
+
+        test "widening a bus past 32 bits moves its cost from one memory to the other" {
+            // the same four ports either side of the boundary: what changes is which budget pays
+            let narrow = costOf 32
+            let wide = costOf 33
+            Expect.equal narrow.HeapBytes 0 "32 bits is still a Uint32Array"
+            Expect.equal wide.TypedArrayBytes 0 "33 bits is not"
+            Expect.isGreaterThan wide.HeapBytes narrow.TypedArrayBytes
+                "a bigint step costs more than a uint32 one: a reference and the object it points at"
+        }
+
+        test "a wider bus costs more per cycle than a narrower one" {
+            Expect.isGreaterThan (costOf 128).HeapBytes (costOf 64).HeapBytes
+                "128 bits needs two 64-bit digits where 64 bits needs one"
+        }
+
+        test "an ordinary length of simulation is allowed" {
+            match simulate 3000 (adderSheet "ok" 16) with
+            | Ok _ -> ()
+            | Error e -> failtest $"a 3000 cycle simulation of four ports should fit: %A{e}"
+        }
+
+        test "a simulation too large to fit is refused rather than attempted" {
+            // ~16 bytes a cycle, so this asks for tens of GB. It must come back as an error, and it
+            // must come back at once - if it allocated first there would be nothing to come back to.
+            match simulate 2_000_000_000 (adderSheet "toobig" 16) with
+            | Error _ -> ()
+            | Ok _ -> failtest "a simulation needing tens of GB of step arrays should be refused"
+        }
+
+        test "the runtime check enforces the budget with headroom, not to the byte" {
+            // The configuration dialog holds users to the budget exactly; this check is the crash
+            // guard of last resort, for a simulation that arrives without passing the dialog - a
+            // LastClock saved into a sheet on a larger machine, above all. So a little past the
+            // budget still builds, and only well past it is refused.
+            let cost = costOf 16
+            let fits = FastCreate.maxCyclesFor cost
+            Expect.isOk
+                (FastCreate.checkSimulationFits fits cost)
+                "the budget-sized simulation must be accepted"
+            Expect.isOk
+                (FastCreate.checkSimulationFits (fits + 1) cost)
+                "just past the budget is inside the headroom and still builds"
+            let pastHeadroom = int (SimulationBudget.runtimeHeadroom * float fits) + 16
+            Expect.isError
+                (FastCreate.checkSimulationFits pastHeadroom cost)
+                "past the headroom it is refused"
+        }
+
+        test "a last clock the configuration dialog allows is never refused by the build" {
+            // The dialog bounds LastClock; the build bounds LastClock plus the zoom margin the
+            // step arrays carry. Both once quoted and checked the same raw array bound, so the
+            // top of the dialog's range - a value it had just called allowed - failed the moment
+            // Start was pressed, with advice ("simulate at most N") that itself failed too.
+            // maxLastClockFor is the one shared answer.
+            let cost = costOf 16
+            let maxLastClock = FastCreate.maxLastClockFor cost
+            Expect.equal (maxLastClock + CommonTypes.waveSimMaxArrayMargin) (FastCreate.maxCyclesFor cost)
+                "the config bound and the array bound differ by exactly the worst-case margin"
+            // the worst case that margin covers: the largest zoom multiplier in use
+            let ws =
+                { ModelHelpers.initWSModel with
+                    WSConfig = { ModelHelpers.initWSModel.WSConfig with LastClock = maxLastClock }
+                    SamplingZoom = List.max CommonTypes.waveSimMultipliers }
+            Expect.isOk
+                (FastCreate.checkSimulationFits (ModelHelpers.Constants.waveSimRequiredArraySize ws) cost)
+                "the largest value the dialog offers must build"
+        }
+
+        test "each budget is applied to its own memory" {
+            // a cost that is large in one memory and nothing in the other is measured against that
+            // memory's budget alone, so the two cannot mask each other
+            let typedOnly = { TypedArrayBytes = 1000; HeapBytes = 0 }
+            let heapOnly = { TypedArrayBytes = 0; HeapBytes = 1000 }
+            let cycles = int (SimulationBudget.runtimeHeadroom * SimulationBudget.maxHeapBytes / 1000.0) + 1
+            Expect.isError (FastCreate.checkSimulationFits cycles heapOnly)
+                "past the heap budget and its headroom, with no typed array use at all"
+            Expect.isOk (FastCreate.checkSimulationFits cycles typedOnly)
+                "the same size in typed arrays is still within the larger budget for them"
+        }
+
+        test "a real design at the waveform simulator's default length is nowhere near the limit" {
+            // The budget exists to stop a design exhausting memory, not to stop ordinary work. This
+            // is a 16-bit CPU across 18 sheets - a large design by the standards of what Issie is
+            // used for - and the default wave simulation must not come close to being refused.
+            let ldcs = TestFixtures.loadProject "3cpu"
+            let top = ldcs |> List.find (fun ldc -> ldc.Name = "eep1")
+            let defaultLength = 3003 // WSConfig.LastClock of 2000, plus the overflow ModelHelpers adds
+            match Simulator.startCircuitSimulation defaultLength "eep1" top.CanvasState ldcs with
+            | Error e -> failtest $"the default wave simulation of a real CPU was refused: %A{e}"
+            | Ok simData ->
+                let cost = simData.FastSim.StepCost
+                let allowed = FastCreate.maxCyclesFor cost
+                printfn "  3cpu/eep1: %d bytes per cycle (%d typed, %d heap), %d cycles allowed"
+                    cost.TotalBytes cost.TypedArrayBytes cost.HeapBytes allowed
+                Expect.isGreaterThan allowed (defaultLength * 10)
+                    "a real design must have room for far more than the default simulation length"
+        }
+
+        test "what the budget charges for is what the build allocates" {
+            // The price is read off the design's merged graph before anything is built, and the
+            // build then allocates from the flattened design. Two walks, and if they ever
+            // disagreed the waveform simulator's configuration dialog and the build itself would
+            // disagree about what a design costs - the dialog offering a length the build refuses.
+            // So this recomputes the total from the components the build actually made.
+            let ldcs = TestFixtures.loadProject "3cpu"
+            let top = ldcs |> List.find (fun ldc -> ldc.Name = "eep1")
+
+            let fromGraph =
+                match Simulator.validateCircuitSimulation "eep1" top.CanvasState ldcs with
+                | Ok graph -> FastCreate.stepCostOfGraph graph
+                | Error e -> failtest $"a real CPU should validate: %A{e}"
+
+            match Simulator.startCircuitSimulation 10 "eep1" top.CanvasState ldcs with
+            | Error e -> failtest $"a real CPU should simulate: %A{e}"
+            | Ok simData ->
+                Expect.equal simData.FastSim.StepCost fromGraph
+                    "the built simulation is priced at what the graph walk said"
+
+                let fs = simData.FastSim
+                let typed, heap =
+                    fs.FCompsByIndex
+                    |> Seq.fold
+                        (fun (typed, heap) (fc: FastComponent) ->
+                            let typed, heap =
+                                ((typed, heap), fc.SimComponent.OutputWidths)
+                                ||> Array.fold (fun (t, h) w ->
+                                    if w <= 32 then t + FastCreate.stepBytesForWidth w, h
+                                    else t, h + FastCreate.stepBytesForWidth w)
+                            if SynchronousUtils.couldBeSynchronousComponent fc.FType then
+                                typed, heap + 4
+                            else
+                                typed, heap)
+                        (0, 0)
+
+                Expect.equal (typed, heap) (fromGraph.TypedArrayBytes, fromGraph.HeapBytes)
+                    "every port the build gave a step array to was charged for, and no other"
+        }
+
+        test "a sheet used twice is charged twice" {
+            // The price is taken by descending into each custom INSTANCE's own graph, which is
+            // what makes a design that expands expensive. Counting each sheet once - pricing the
+            // files rather than the expansion - would say a hierarchy costs almost nothing.
+            let costOfSheet (copies: int) =
+                let top = chainSheet $"chain{copies}" leaf copies
+                match Simulator.validateCircuitSimulation top.Name top.CanvasState [ leaf; top ] with
+                | Ok graph -> (FastCreate.stepCostOfGraph graph).TotalBytes
+                | Error e -> failtest $"a chain of {copies} instances should validate: %A{e}"
+
+            // each extra instance adds the same custom component and the same whole copy of the
+            // leaf below it, so the price is linear in the number of instances
+            let none, one, two = costOfSheet 0, costOfSheet 1, costOfSheet 2
+            Expect.isGreaterThan (one - none) 0 "an instance costs something"
+            Expect.equal (two - one) (one - none)
+                "and the second instance costs exactly what the first one did"
+        }
+
+        test "a design with nothing to store is not refused" {
+            // guards the division: a cost of zero bytes a step must not be a division by zero
+            Expect.isOk
+                (FastCreate.checkSimulationFits 1_000_000 { TypedArrayBytes = 0; HeapBytes = 0 })
+                "no step arrays means no limit on how long it may run"
+        }
+
+        //--------------------------------------------------------------------------------------//
+        // The expanded design, which is the other thing that exhausts memory                    //
+        //--------------------------------------------------------------------------------------//
+
+        test "the expanded size of a hierarchy is counted, not the sheets on disk" {
+            // leaf is 3 components. Each level is IN + OUT + `copies` instances, and holds a whole
+            // expanded copy of the level below per instance, so the count multiplies.
+            Expect.equal (expandedCount 0 2) 3.0 "the leaf alone"
+            Expect.equal (expandedCount 1 2) (4.0 + 2.0 * 3.0) "one level of two instances"
+            Expect.equal (expandedCount 2 2) (4.0 + 2.0 * 10.0) "two levels: 24, not 3 + 4 + 4"
+            Expect.equal (expandedCount 3 8) (10.0 + 8.0 * (10.0 + 8.0 * (10.0 + 8.0 * 3.0)))
+                "eight-way, three deep"
+        }
+
+        test "a hierarchy that fits is simulated" {
+            let top, sheets = hierarchy 3 8
+            match Simulator.startCircuitSimulation 10 top.Name top.CanvasState sheets with
+            | Ok _ -> ()
+            | Error e -> failtest $"a design expanding to ~2000 components should simulate: %A{e}"
+        }
+
+        test "a hierarchy too large to expand is refused, without expanding it" {
+            // Eight sheets, none of them big, expanding to millions of components. The test
+            // finishing at all is most of the assertion: were the design built before being
+            // measured, this would take the machine down rather than fail.
+            let top, sheets = hierarchy 7 8
+            let predicted = GraphMerger.expandedComponentCount top.Name top.CanvasState sheets
+            Expect.isGreaterThan predicted 5_000_000.0 "this hierarchy expands to millions"
+            match Simulator.startCircuitSimulation 10 top.Name top.CanvasState sheets with
+            | Ok _ -> failtest "a design expanding to millions of components should be refused"
+            | Error e ->
+                match e.ErrType with
+                | GenericSimError msg ->
+                    Expect.stringContains msg "components" "the refusal says what the size is in"
+                    Expect.stringContains msg "lvl" "and names the sheets the size comes from"
+                | other -> failtest $"expected a plain simulation error, got %A{other}"
+        }
+
+        test "the expansion is measured in ports as well as components" {
+            // What a component costs depends on how many ports it has - the FastComponent holds a
+            // link, a driver and an output array per port - so a sheet of wide gates must be
+            // charged more than a sheet of the same number of narrow ones.
+            let gateSheet (name: string) (fanIn: int) =
+                let inp = makeComp 1 0 1 (Input1(1, None)) "IN"
+                let g = makeComp 3 fanIn 1 (GateN(And, fanIn)) "G"
+                let out = makeComp 2 1 0 (Output 1) "OUT"
+                let feed = [ for i in 0 .. fanIn - 1 -> conn inp 0 g i ]
+                makeLdc name None ([ inp; g; out ], feed @ [ conn g 0 out 0 ])
+
+            let narrow = gateSheet "narrow" 2
+            let wide = gateSheet "wide" 8
+            let compsN, portsN = GraphMerger.expandedSize "narrow" narrow.CanvasState [ narrow ]
+            let compsW, portsW = GraphMerger.expandedSize "wide" wide.CanvasState [ wide ]
+            Expect.equal compsN compsW "both sheets have the same three components"
+            Expect.isGreaterThan portsW portsN "but the wide one has six more ports"
+            Expect.isGreaterThan
+                (SimulationBudget.heapBytesPerComponent (portsW / compsW))
+                (SimulationBudget.heapBytesPerComponent (portsN / compsN))
+                "so a component of the wide sheet is charged more than one of the narrow sheet"
+        }
+
+        test "counting a hierarchy is linear in its sheets, not in its expansion" {
+            // 20 levels of 8 is 8^20 components - more than there are atoms to store them in. The
+            // count must still come back, and come back as a number rather than an overflow.
+            let top, sheets = hierarchy 20 8
+            let predicted = GraphMerger.expandedComponentCount top.Name top.CanvasState sheets
+            Expect.isGreaterThan predicted 1.0e18 "8^20 is a very large number of components"
+            Expect.isTrue (System.Double.IsFinite predicted) "and it must be a number, not infinity"
+        }
+
+        //--------------------------------------------------------------------------------------//
+        // Where a waveform simulation starts.
+        //
+        // Fitting in memory is not the same as being worth waiting for. A design can pass every
+        // check above and still spend minutes building step arrays and wave records before showing
+        // anything, so a big one starts at a clock count it can be started in and says so.
+        //--------------------------------------------------------------------------------------//
+
+        test "a big design starts its default short, and a small one starts where it was asked to" {
+            let budget = SimulationBudget.maxHeapBytes
+            let defaultClock = ModelHelpers.Constants.defaultWSConfig.LastClock
+            let atShare share = ModelHelpers.startingLastClock defaultClock (share * budget)
+            Expect.equal (atShare 0.5) ModelHelpers.Constants.shortStartClock
+                "half the heap budget is a design to start short"
+            Expect.equal (atShare 0.001) defaultClock
+                "a design of no size starts at what it was configured for"
+            Expect.equal (ModelHelpers.startingLastClock defaultClock 0.0) defaultClock
+                "and so does one whose size is not known"
+        }
+
+        test "an explicitly configured cycle count is honoured whatever the design's size" {
+            // The regression this guards: main6 of largeTest, configured to 4000 cycles well
+            // inside the limit its own dialog stated, was silently started at 200 - and with the
+            // dialog closed to a running simulation, there was no way to raise it. Only the
+            // untouched default may be started short; a chosen value is a choice.
+            // (An earlier version also tapered the allowed cycles as 40/share below the
+            // threshold, which capped any design past a few dozen components.)
+            let budget = SimulationBudget.maxHeapBytes
+            Expect.equal (ModelHelpers.startingLastClock 4000 (0.5 * budget)) 4000
+                "a value the user set stands even on a design past the threshold"
+            Expect.equal (ModelHelpers.startingLastClock 1_000_000 (0.19 * budget)) 1_000_000
+                "and below the threshold, however large the value"
+        }
+
+        //--------------------------------------------------------------------------------------//
+        // The step simulator, which has no configuration dialog to hold the user to a budget.
+        //
+        // It picks one number - how many cycles of history to keep - so the budget binds on that.
+        // It asks for what it wants, takes what the design can afford, and refuses a design that
+        // cannot afford even the minimum, where there would be no past to step back through.
+        //--------------------------------------------------------------------------------------//
+
+        test "a design that fits gets the history the step simulator asked for" {
+            let cheap = { TypedArrayBytes = 100; HeapBytes = 0 }
+            Expect.equal (ModelHelpers.stepSimCycles 550 cheap) (Some 550)
+                "a design of a hundred bytes a cycle can afford far more than 550 of them"
+        }
+
+        test "a design too big for the full history is shortened, not refused" {
+            // priced so that the budget allows somewhere between the minimum and what was asked
+            let target = 100
+            let perCycle = int (SimulationBudget.maxTypedArrayBytes / float target)
+            let cost = { TypedArrayBytes = perCycle; HeapBytes = 0 }
+            match ModelHelpers.stepSimCycles 550 cost with
+            | None -> failtest "a design that can afford 100 cycles must be simulated, not refused"
+            | Some size ->
+                Expect.isLessThan size 550 "it cannot have what it asked for"
+                Expect.isGreaterThanOrEqual size ModelHelpers.Constants.minStepArraySize
+                    "but it keeps at least the minimum history"
+                Expect.equal size (FastCreate.maxCyclesFor cost)
+                    "and it takes exactly what the budget allows"
+        }
+
+        test "a design that cannot afford the minimum history is refused" {
+            // one cycle of this costs a fifth of the whole budget, so twenty of them cannot fit
+            let perCycle = int (SimulationBudget.maxTypedArrayBytes / 5.0)
+            let cost = { TypedArrayBytes = perCycle; HeapBytes = 0 }
+            Expect.isLessThan (FastCreate.maxCyclesFor cost) ModelHelpers.Constants.minStepArraySize
+                "this design really cannot hold the minimum history"
+            Expect.equal (ModelHelpers.stepSimCycles 550 cost) None
+                "so it is refused rather than simulated with almost no history"
+        }
+
+        test "the size the step simulator chooses is one its own build will accept" {
+            // The choice is made against maxCyclesFor, which is the budget without the headroom
+            // checkSimulationFits allows itself - so whatever is chosen here passes there, and the
+            // refusal happens where it can be explained rather than inside the build.
+            [ 10; 1000; 100_000; 5_000_000 ]
+            |> List.iter (fun perCycle ->
+                let cost = { TypedArrayBytes = perCycle; HeapBytes = perCycle / 4 }
+                match ModelHelpers.stepSimCycles 550 cost with
+                | None -> ()
+                | Some size ->
+                    Expect.isOk (FastCreate.checkSimulationFits size cost)
+                        $"a step simulation of {size} cycles at {perCycle} bytes a cycle must build")
+        }
+
+        test "a design with nothing to store keeps the whole history" {
+            Expect.equal (ModelHelpers.stepSimCycles 550 { TypedArrayBytes = 0; HeapBytes = 0 }) (Some 550)
+                "no step arrays means no reason to shorten"
+        }
+
+        test "a design is never started at more cycles than it asked for" {
+            let budget = SimulationBudget.maxHeapBytes
+            Expect.equal (ModelHelpers.startingLastClock 50 (0.5 * budget)) 50
+                "a configuration below the short start is left alone"
+            Expect.equal (ModelHelpers.startingLastClock 50 (0.0001 * budget)) 50
+                "and so is one on a design of no size"
+        }
+
+        test "the step arrays carry a zoom margin the simulation could use, not the largest there is" {
+            let ws lastClock zoom =
+                { ModelHelpers.initWSModel with
+                    WSConfig = { ModelHelpers.initWSModel.WSConfig with LastClock = lastClock }
+                    SamplingZoom = zoom }
+            // The margin covers reading one sample past the end at the multiplier in use.
+            Expect.equal (ModelHelpers.Constants.waveSimRequiredArraySize (ws 2000 1)) (2000 + 3 + 1000)
+                "a long simulation can be zoomed out the whole way, so it keeps the whole margin"
+            Expect.equal (ModelHelpers.Constants.waveSimRequiredArraySize (ws 200 1)) (200 + 3 + 200)
+                "a 200-cycle simulation used to allocate 1203 cycles of arrays for zooms it cannot use"
+            Expect.equal (ModelHelpers.Constants.waveSimRequiredArraySize (ws 200 500)) (200 + 3 + 500)
+                "the multiplier actually in use is covered whatever the configuration has shrunk to"
+        }
+    ]

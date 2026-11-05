@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- The production binary's name, and what scripts/clean-dev.js matches a stale one by. -->
+    <AssemblyName>issie-sidecar</AssemblyName>
+    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64</RuntimeIdentifiers>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- For the BUILD, not the run loop. A simulation's run loop collects nothing at all -
+         SimLog records 0/0/0 over a 400-cycle run of a 480,000-component design - but building
+         one allocates hard, and on that design the default collector spent 31% of a 22.8s build
+         in GC pause against 16% of a 15.6s build here. Measured on largeTest/main6; see
+         docs/dev/sidecarSimulation.md. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The renderer compiles under plain .NET too (the test suite proves it daily), which is
+         what lets this process share CommonTypes, the JSON codecs and, in time, the simulator. -->
+    <ProjectReference Include="..\Renderer\Renderer.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Protocol.fs" />
+    <Compile Include="DesignCache.fs" />
+    <Compile Include="SimSession.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <Import Project="..\..\.paket\Paket.Restore.targets" />
+</Project>

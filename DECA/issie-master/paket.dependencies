@@ -1,0 +1,62 @@
+framework: auto-detect
+source https://api.nuget.org/v3/index.json
+
+group Electron
+	source https://api.nuget.org/v3/index.json
+	// The Fable 5 / Fable.Core 5 package generation (stage B of the upgrade from
+	// Fable.Core 3). Compiled by the Fable 5 CLI (see dotnet-tools.json).
+	// Fable.Electron and Fable.Import.Node are gone: no code used them (the app has its
+	// own ElectronAPI.fs bindings); Fable.Node - which IS used - was only resolving as a
+	// transitive dependency of Fable.Electron, so it is now explicit.
+	nuget Fable.Browser.Css
+	nuget Fable.Core ~> 5.2
+	nuget Fable.Elmish ~> 5.0
+	nuget Fable.Elmish.Debugger ~> 4.2
+	nuget Fable.Elmish.HMR ~> 9.0
+	nuget Fable.Elmish.React ~> 5.6
+	nuget Fable.Node ~> 1.6
+	nuget Fable.Browser.Dom
+	nuget Fable.Parsimmon
+	nuget Fable.Promise
+	nuget Fable.React ~> 9.4
+	nuget FSharp.Core  redirects:force
+	nuget Fulma ~> 3.0
+	nuget Fulma.Extensions.Wikiki.Tooltip ~> 4.0
+	nuget Thoth.Json ~> 10.5
+	nuget Thoth.Json.Net
+	// test-only packages, in this group so Tests/Issie.Tests gets a single
+	// unified resolution (mixing groups made paket install fail on FSharp.Core)
+	nuget Expecto ~> 9.0.4
+	nuget Expecto.FsCheck ~> 9.0.4
+	nuget FsCheck ~> 2.16.5
+
+group Testing
+	source https://api.nuget.org/v3/index.json
+
+	nuget Expecto 
+	nuget Expecto.BenchmarkDotNet
+	nuget Expecto.FsCheck 
+	nuget Expecto.TestResults 
+	nuget Foq 
+	nuget FSharp.Core redirects:force
+	nuget FSharp.Data
+	nuget Logary
+	nuget Microsoft.NETCore.Platforms
+
+group FakeBuild
+	source https://api.nuget.org/v3/index.json
+
+	storage: none
+	nuget FSharp.Core ~> 6.0.1 redirects:force
+	nuget Fake.Core.Target 
+	nuget Fake.Core.ReleaseNotes 
+	nuget Fake.DotNet.AssemblyInfoFile 
+	nuget Fake.DotNet.Cli 
+	nuget Fake.DotNet.MSBuild 
+	nuget Fake.DotNet.Paket 
+	nuget Fake.IO.FileSystem 
+	nuget Fake.Tools.Git 
+	nuget Fake.JavaScript.Npm
+	nuget FSharp.Json
+	nuget dotnet-fake
+	nuget dotnet-fable
